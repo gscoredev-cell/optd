@@ -14,7 +14,7 @@ if ($status.ts -and ($c = ConvertTo-Epoch $pod.created)) {
     $min = ($status.ts - $c) / 60
     [string]::Format($Inv, 'final {0} | pod created -> final status {1:0.0} min x {2:0.00} $/h = ${3:0.00}', $status.state, $min, [double]$pod.price, $min * $pod.price / 60)
 }
-if (Get-Pods | Where-Object id -eq $pod.id) {
+if ((Get-Pods | Where-Object id -eq $pod.id) -or (Get-Pod $pod.id)) {
     & "$PSScriptRoot/kill.ps1" $pod.id
     'SELF_TERMINATE_FAILED' | Set-Content (Join-Path $runDir 'SELF_TERMINATE_FAILED')
     "SELF_TERMINATE_FAILED: pod $($pod.id) was still present and has been deleted"

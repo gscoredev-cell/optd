@@ -54,11 +54,15 @@ function Start-Pod($g) {
     # next GPU; anything else stops.
     $errId = ($res | ForEach-Object { ConvertFrom-JsonOrNull "$_" } | Where-Object { $_.id } | Select-Object -Last 1).id
     if ($errId -and $out -match 'no longer listed') {
-        # runpodctl --wait reads the default pod list, which hides pods still pulling their image; keep waiting via pod get.
-        "--wait lost the pod while it was initializing; waiting via pod get" | Out-Host
-        $until = (Get-Date).AddMinutes(10)
-        while ((Get-Date) -lt $until -and ($p = Get-Pod $errId)) {
+        # The API hides a pod for minutes while it pulls its image (pod list --all and pod get both miss it), which makes
+        # runpodctl --wait give up. Keep polling pod get; the in-pod deadline watchdog bounds the cost meanwhile.
+        "--wait lost the pod while it was initializing; polling pod get for up to 10 min" | Out-Host
+        $t1 = Get-Date; $last = ''
+        while (((Get-Date) - $t1).TotalMinutes -lt 10) {
+            $p = Get-Pod $errId
             if ($p.publicIp -and $p.portMappings.'22') { return @{ pod = $p; gpu = $g; max = $max; deadline = $deadline; name = $name } }
+            $st = if ($p) { "$($p.desiredStatus)/$($p.runtimeStatus)" } else { 'not visible to pod get' }
+            if ($st -ne $last) { "  +$([int]((Get-Date) - $t1).TotalSeconds) s: $st" | Out-Host; $last = $st }
             Start-Sleep -Seconds 15
         }
     }

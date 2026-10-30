@@ -22,7 +22,10 @@ while ($true) {
     if (-not $pod) {
         $s = ConvertFrom-JsonOrNull (Get-S3Text "runs/$RunId/status.json")   # DONE may have landed just before self-terminate
         if ($s.state -eq 'DONE') { "[$(Get-Date -Format HH:mm:ss)] state=DONE step=$($s.step)"; exit 0 }
-        "[$(Get-Date -Format HH:mm:ss)] FAILED: pod gone without DONE (last: $($s.state)|$($s.step) $($s.msg))"; exit 2
+        # The API hides pods while they pull their image; only a stale status.json (heartbeat is 5 min) means gone.
+        if (((Get-Date) - $lastChange).TotalMinutes -ge 12) {
+            "[$(Get-Date -Format HH:mm:ss)] FAILED: pod gone without DONE (last: $($s.state)|$($s.step) $($s.msg))"; exit 2
+        }
     }
     if ($pod.desiredStatus -eq 'RUNNING' -and ((Get-Date) - $lastChange).TotalMinutes -ge $StallMinutes) {
         & "$PSScriptRoot/kill.ps1" $podId
