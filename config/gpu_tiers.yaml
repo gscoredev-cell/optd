@@ -1,0 +1,6 @@
+# OPTION_D_SPEC.md §6. Tier = largest tier whose min_vram_gb <= measured VRAM (GiB). pod/bootstrap.sh mirrors the thresholds.
+tiers:
+  24: {min_vram_gb: 20, gen_batch: 16, teacher_prefill_batch: 8, coresident: "no"}
+  32: {min_vram_gb: 30, gen_batch: 24, teacher_prefill_batch: 12, coresident: "inference"}
+  48: {min_vram_gb: 40, gen_batch: 32, teacher_prefill_batch: 16, coresident: "yes"}
+  80: {min_vram_gb: 70, gen_batch: 64, teacher_prefill_batch: 32, coresident: "yes"}

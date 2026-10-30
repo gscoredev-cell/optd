@@ -1,0 +1,19 @@
+# Flat `key: <JSON value>` lines only, no trailing comments: orchestrator/common.ps1 parses each value with
+# ConvertFrom-Json, pod/bootstrap.sh greps `image:`, the pipeline uses PyYAML (JSON flow syntax is valid YAML).
+image: "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
+min_cuda_version: "12.8"
+container_disk_gb: 30
+network_volume_id: "5l0v4bx88l"
+datacenter: "US-KS-2"
+s3_endpoint: "https://s3api-us-ks-2.runpod.io"
+s3_region: "us-ks-2"
+git_repo: "https://github.com/gscoredev-cell/optd"
+git_raw: "https://raw.githubusercontent.com/gscoredev-cell/optd"
+gpu_order: ["NVIDIA A40", "NVIDIA RTX A6000", "NVIDIA L40", "NVIDIA L40S", "NVIDIA RTX PRO 4500 Blackwell Server Edition", "NVIDIA GeForce RTX 4090", "NVIDIA L4", "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", "NVIDIA GeForce RTX 3090", "NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"]
+phase_budget_usd: {"ENVCHECK": 1, "SMOKE": 4, "FULL": 10}
+phase_ceiling_min: {"ENVCHECK": 30, "SMOKE": 180, "FULL": 900}
+deadline_grace_min: 20
+student: "Qwen/Qwen3-1.7B"
+teacher: "Qwen/Qwen3-8B"
+models_min_gb: {"Qwen/Qwen3-1.7B": 3.9, "Qwen/Qwen3-8B": 16.0}
+dataset: "apple/GSM-Symbolic"

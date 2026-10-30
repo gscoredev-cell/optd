@@ -1,0 +1,19 @@
+{
+  "env": { "BASH_DEFAULT_TIMEOUT_MS": "600000", "BASH_MAX_TIMEOUT_MS": "7200000" },
+  "permissions": {
+    "allow": [
+      "Bash(pwsh -ExecutionPolicy Bypass -File orchestrator/*)",
+      "Bash(runpodctl pod list*)", "Bash(runpodctl pod get*)", "Bash(runpodctl pod delete*)",
+      "Bash(runpodctl gpu list*)", "Bash(runpodctl datacenter list*)",
+      "Bash(aws --profile runpod s3 *)",
+      "Bash(git status*)", "Bash(git add*)", "Bash(git commit*)", "Bash(git log*)", "Bash(git diff*)", "Bash(git push origin main)",
+      "Bash(python pipeline/*)", "Bash(python -m pytest*)"
+    ],
+    "deny": [
+      "Bash(runpodctl pod create*)", "Bash(runpodctl pod start*)", "Bash(runpodctl pod stop*)",
+      "Bash(git push -f*)", "Bash(git push --force*)", "Bash(git push * +*)",
+      "Bash(env*)", "Bash(set*)", "Bash(printenv*)", "Bash(python -c*)",
+      "Read(./.env)", "Read(./.env.*)", "Read(~/.aws/**)", "Read(~/.ssh/**)"
+    ]
+  }
+}

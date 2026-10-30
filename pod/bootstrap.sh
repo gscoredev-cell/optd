@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Pod bootstrap (OPTION_D_SPEC.md §5). Fetched by commit SHA and piped into bash, so the whole body lives in main():
+# bash parses it completely before running anything, and no command can swallow the rest of the script from stdin.
+
+R=""
+step()  { echo "$1" > "$R/.step"; write_status RUNNING "$1" ""; echo "== $1 $(date -u +%FT%TZ)"; }
+write_status() {   # state step msg   (atomic: tmp + mv)
+  local tmp; tmp=$(mktemp -p "$R" .status.XXXXXX)
+  printf '{"run_id":"%s","state":"%s","step":"%s","msg":"%s","ts":%s}\n' \
+    "$RUN_ID" "$1" "$2" "$(printf '%s' "$3" | tr -d '"\\\n' | cut -c1-300)" "$(date +%s)" > "$tmp" && mv "$tmp" "$R/status.json"
+}
+mask() { sed -u -e "s|${HF_TOKEN:-@none@}|***|g" -e "s|${RUNPOD_API_KEY:-@none@}|***|g" -e "s|${GIT_READ_TOKEN:-@none@}|***|g"; }
+terminate() {   # pod-scoped RUNPOD_API_KEY injected by RunPod
+  for _ in 1 2 3 4 5; do
+    runpodctl pod delete "$RUNPOD_POD_ID" && return 0
+    runpodctl remove pod "$RUNPOD_POD_ID" && return 0   # older runpodctl inside the image
+    curl -fsS -X DELETE "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" -H "Authorization: Bearer $RUNPOD_API_KEY" && return 0
+    sleep 30
+  done
+  return 1
+}
+on_exit() {
+  local rc=$? msg=""
+  kill "$HB" 2>/dev/null || true
+  if [ "$rc" -eq 0 ]; then write_status DONE "$(cat "$R/.step")" ""
+  else
+    [ -s "$R/.err" ] && msg=$(head -1 "$R/.err")
+    write_status FAILED "$(cat "$R/.step")" "rc=$rc ${msg}"
+  fi
+  echo "== exit rc=$rc; self-terminating"
+  sleep 2; sync
+  terminate || echo "self-terminate failed; deadline watchdog will delete the pod"
+  sleep infinity
+}
+fetch() {   # kind repo min_gb   (models -> /workspace/models/<name>; dataset -> HF cache). Caller holds the download lock.
+  local kind=$1 repo=$2 min_gb=$3 dest marker t0 t1 bytes mbps
+  if [ "$kind" = model ]; then dest=/workspace/models/${repo##*/}; marker=$dest/.complete
+  else dest=""; marker=/workspace/hf/.complete-${repo//\//__}; fi
+  if [ -f "$marker" ]; then
+    echo "cache hit $repo"
+    printf '{"repo":"%s","kind":"%s","cache":"hit"}\n' "$repo" "$kind" >> "$R/downloads.jsonl"; return 0
+  fi
+  local author
+  author=$(curl -fsS "https://huggingface.co/api/${kind}s/$repo" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("author",""))')
+  [ "$author" = "${repo%%/*}" ] || { echo "org mismatch for $repo: '$author'" > "$R/.err"; return 1; }
+  t0=$(date +%s.%N)
+  if [ "$kind" = model ]; then
+    rm -rf "$dest"
+    hf download "$repo" --local-dir "$dest" --exclude "original/*" < /dev/null > /dev/null
+    bytes=$(du -sb "$dest" | cut -f1)
+  else
+    dest=$(hf download "$repo" --repo-type dataset < /dev/null | tail -1)
+    bytes=$(du -sbL "$dest" | cut -f1)
+  fi
+  t1=$(date +%s.%N)
+  python3 -c "import sys; sys.exit(0 if $bytes >= $min_gb * 1e9 else 1)" \
+    || { echo "size check failed for $repo: $bytes bytes < $min_gb GB" > "$R/.err"; return 1; }
+  mbps=$(python3 -c "print(round($bytes / 1e6 / max($t1 - $t0, 1e-3), 1))")
+  echo "downloaded $repo $((bytes / 1000000)) MB at $mbps MB/s"
+  printf '{"repo":"%s","kind":"%s","cache":"download","mb":%s,"sec":%s,"mb_per_s":%s}\n' \
+    "$repo" "$kind" "$((bytes / 1000000))" "$(python3 -c "print(round($t1 - $t0, 1))")" "$mbps" >> "$R/downloads.jsonl"
+  touch "$marker"
+}
+
+main() {
+  # 0. Keep the image's sshd + PUBLIC_KEY setup alive.
+  /start.sh > /tmp/start.log 2>&1 &
+  set -eEuo pipefail
+  export BOOT_EPOCH; BOOT_EPOCH=$(date +%s)
+  R=/workspace/runs/$RUN_ID; mkdir -p "$R"
+  exec > >(mask | tee -a "$R/log.txt") 2>&1
+  echo "== bootstrap $RUN_ID phase=$PHASE sha=$GIT_SHA max_minutes=$MAX_MINUTES deadline_epoch=$DEADLINE_EPOCH"
+
+  # Deadline watchdog: absolute epoch, so a container restart does not reset the clock.
+  ( set +e; while [ "$(date +%s)" -lt "$DEADLINE_EPOCH" ]; do sleep 60; done
+    echo "== deadline watchdog: DEADLINE_EPOCH=$DEADLINE_EPOCH reached at $(date +%s); deleting pod"
+    write_status FAILED deadline "deadline watchdog"
+    sync; terminate ) &
+
+  # Restart-loop guard: a finished run never runs again.
+  if [ -f "$R/status.json" ] && grep -Eq '"state":"(DONE|FAILED)"' "$R/status.json"; then
+    echo "== restart guard: final status present; terminating"
+    terminate || true; sleep infinity
+  fi
+
+  # 1. Heartbeat + final status/self-terminate.
+  rm -f "$R/.err"; echo boot > "$R/.step"; write_status RUNNING boot ""
+  ( set +e; while true; do sleep 300; write_status RUNNING "$(cat "$R/.step")" ""; done ) & HB=$!
+  trap on_exit EXIT
+  trap '[ -s "$R/.err" ] || echo "line $LINENO: $BASH_COMMAND" > "$R/.err"' ERR
+
+  # 2. GPU tier (thresholds mirror config/gpu_tiers.yaml).
+  step gpu
+  local gpu vram_mib gib tier
+  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+  vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' ')
+  gib=$((vram_mib / 1024))
+  if [ -n "${GPU_TIER_OVERRIDE:-}" ]; then tier=$GPU_TIER_OVERRIDE
+  elif [ "$gib" -ge 70 ]; then tier=80; elif [ "$gib" -ge 40 ]; then tier=48
+  elif [ "$gib" -ge 30 ]; then tier=32; elif [ "$gib" -ge 20 ]; then tier=24
+  else echo "VRAM ${gib} GiB below tier 24" > "$R/.err"; exit 1; fi
+  echo "gpu=$gpu vram_mib=$vram_mib tier=$tier"
+  printf '{"run_id":"%s","phase":"%s","seed":"%s","git_sha":"%s","pod_id":"%s","gpu":"%s","vram_mib":%s,"tier":%s,"driver":"%s","max_minutes":%s,"deadline_epoch":%s,"price_per_hr":%s}\n' \
+    "$RUN_ID" "$PHASE" "${SEED:-0}" "$GIT_SHA" "${RUNPOD_POD_ID:-}" "$gpu" "$vram_mib" "$tier" \
+    "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)" "$MAX_MINUTES" "$DEADLINE_EPOCH" "${PRICE_PER_HR:-0}" > "$R/env.json"
+
+  # 3. Code on the container disk, never the volume.
+  step code
+  rm -rf /root/repo && mkdir /root/repo && cd /root/repo
+  git init -q && git remote add origin "$GIT_REPO"
+  git fetch -q --depth 1 origin "$GIT_SHA" && git checkout -q FETCH_HEAD
+
+  # 4. venv on the volume keyed by image tag; reinstall when the requirement files change.
+  step venv
+  local image venv req
+  image=$(sed -nE 's/^image: *"(.*)"$/\1/p' config/run_defaults.yaml)
+  venv=/workspace/venv/$(printf '%s' "$image" | tr -c 'A-Za-z0-9._-' '_')
+  req=$(cat pod/requirements.txt pod/constraints.txt | sha256sum | cut -c1-16)
+  (
+    flock 9
+    [ -f "$venv/.complete" ] || { rm -rf "$venv"; python3 -m venv --system-site-packages "$venv"; }
+    if [ "$(cat "$venv/.complete" 2>/dev/null)" != "$req" ]; then
+      "$venv/bin/pip" install -q --disable-pip-version-check -r pod/requirements.txt -c pod/constraints.txt < /dev/null
+      echo "$req" > "$venv/.complete"; echo "venv installed $venv"
+    else echo "venv cache hit $venv"; fi
+  ) 9> /workspace/.venv.lock
+  # shellcheck disable=SC1091
+  set +u; source "$venv/bin/activate"; set -u
+  export HF_HOME=/workspace/hf HF_HUB_DISABLE_PROGRESS_BARS=1 PYTHONUNBUFFERED=1
+
+  # 5. Models and dataset under one lock (parallel pods share the volume).
+  step models
+  mkdir -p /workspace/models /workspace/hf
+  local line
+  exec 8> /workspace/.dl.lock; flock 8
+  mapfile -t lines < <(python -c 'import yaml; c = yaml.safe_load(open("config/run_defaults.yaml")); [print(r, g) for r, g in c["models_min_gb"].items()]')
+  for line in "${lines[@]}"; do fetch model ${line}; done
+  fetch dataset "$(sed -nE 's/^dataset: *"(.*)"$/\1/p' config/run_defaults.yaml)" 0
+  flock -u 8
+
+  # 6. Pipeline, bounded by the pod budget (floor 60 s so tiny test budgets still start).
+  step pipeline
+  local t=$((MAX_MINUTES * 60 - 600)); [ "$t" -ge 60 ] || t=60
+  timeout "$t" python pipeline/run_phase.py --phase "$PHASE" --run-id "$RUN_ID" --seed "${SEED:-0}" --tier "$tier" < /dev/null
+
+  # 7. run_phase.py wrote report.md + metrics.json; exit 0 -> trap writes DONE and terminates the pod.
+  step report
+  exit 0
+}
+
+main "$@"

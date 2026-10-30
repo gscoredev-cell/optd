@@ -1,0 +1,7 @@
+runs/*/*
+!runs/*/report.md
+!runs/*/metrics.json
+!runs/*/JUDGEMENT.md
+orchestrator/watchdog.log
+.claude/settings.local.json
+__pycache__/
