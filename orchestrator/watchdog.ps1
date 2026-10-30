@@ -25,5 +25,21 @@ try {
             $deleted++
         }
     }
-    Log "run: $($pods.Count) optd pods, $deleted deleted"
+    # Unlisted is never gone: launched pods (local pod.json, last 24 h) that the API does not show, that were not killed
+    # by kill.ps1 and did not log their own deletion, with no heartbeat for 10+ min are UNKNOWN.
+    $killed = Get-Content (Join-Path $PSScriptRoot 'killed.log') -ErrorAction SilentlyContinue
+    $unknown = 0
+    foreach ($f in Get-ChildItem (Join-Path $Root 'runs/*/pod.json') -ErrorAction SilentlyContinue) {
+        $pj = ConvertFrom-JsonOrNull (Get-Content $f -Raw)
+        $created = ConvertTo-Epoch $pj.created
+        if (-not $pj.id -or -not $created -or $now - $created -gt 86400 -or $now - $created -lt 600) { continue }
+        if ($pods.id -contains $pj.id -or ($killed -match [regex]::Escape($pj.id))) { continue }
+        $runId = $f.Directory.Name
+        $s = ConvertFrom-JsonOrNull (Get-S3Text "runs/$runId/status.json")
+        if ($s.state -in 'DONE', 'FAILED' -or ($s.ts -and $now - [long]$s.ts -lt 600)) { continue }
+        if ((Get-S3Text "runs/$runId/log.txt") -match "pod delete accepted|pod `"$([regex]::Escape($pj.id))`" removed") { continue }
+        Log "UNKNOWN $($pj.id) ${runId}: not listed, no heartbeat for 10+ min — check RunPod console"
+        $unknown++
+    }
+    Log "run: $($pods.Count) optd pods, $deleted deleted, $unknown unknown"
 } catch { Log "ERROR $($_.Exception.Message)"; exit 1 }

@@ -5,3 +5,4 @@ runs/*/*
 orchestrator/watchdog.log
 .claude/settings.local.json
 __pycache__/
+orchestrator/killed.log

@@ -12,9 +12,9 @@ write_status() {   # state step msg   (atomic: tmp + mv)
 mask() { sed -u -e "s|${HF_TOKEN:-@none@}|***|g" -e "s|${RUNPOD_API_KEY:-@none@}|***|g" -e "s|${GIT_READ_TOKEN:-@none@}|***|g"; }
 terminate() {   # pod-scoped RUNPOD_API_KEY injected by RunPod
   for _ in 1 2 3 4 5; do
-    runpodctl pod delete "$RUNPOD_POD_ID" && return 0
-    runpodctl remove pod "$RUNPOD_POD_ID" && return 0   # older runpodctl inside the image
-    curl -fsS -X DELETE "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" -H "Authorization: Bearer $RUNPOD_API_KEY" && return 0
+    { runpodctl pod delete "$RUNPOD_POD_ID" || runpodctl remove pod "$RUNPOD_POD_ID" \
+      || curl -fsS -X DELETE "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" -H "Authorization: Bearer $RUNPOD_API_KEY"; } \
+      && { echo "== pod delete accepted ($RUNPOD_POD_ID)"; return 0; }   # older runpodctl in the image only has `remove pod`
     sleep 30
   done
   return 1
@@ -100,9 +100,13 @@ main() {
   elif [ "$gib" -ge 30 ]; then tier=32; elif [ "$gib" -ge 20 ]; then tier=24
   else echo "VRAM ${gib} GiB below tier 24" > "$R/.err"; exit 1; fi
   echo "gpu=$gpu vram_mib=$vram_mib tier=$tier"
-  printf '{"run_id":"%s","phase":"%s","seed":"%s","git_sha":"%s","pod_id":"%s","gpu":"%s","vram_mib":%s,"tier":%s,"driver":"%s","max_minutes":%s,"deadline_epoch":%s,"price_per_hr":%s}\n' \
+  # image pull = pod create (LAUNCH_EPOCH, local clock) -> bootstrap start; RUNPOD_TCP_PORT_22 is set only if a public port exists
+  local pull=$((BOOT_EPOCH - ${LAUNCH_EPOCH:-$BOOT_EPOCH}))
+  echo "image pull ${pull} s; public ssh port: ${RUNPOD_TCP_PORT_22:-none}"
+  printf '{"run_id":"%s","phase":"%s","seed":"%s","git_sha":"%s","pod_id":"%s","gpu":"%s","vram_mib":%s,"tier":%s,"driver":"%s","max_minutes":%s,"deadline_epoch":%s,"price_per_hr":%s,"launch_epoch":%s,"boot_epoch":%s,"image_pull_sec":%s,"ssh_public_port":"%s"}\n' \
     "$RUN_ID" "$PHASE" "${SEED:-0}" "$GIT_SHA" "${RUNPOD_POD_ID:-}" "$gpu" "$vram_mib" "$tier" \
-    "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)" "$MAX_MINUTES" "$DEADLINE_EPOCH" "${PRICE_PER_HR:-0}" > "$R/env.json"
+    "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)" "$MAX_MINUTES" "$DEADLINE_EPOCH" "${PRICE_PER_HR:-0}" \
+    "${LAUNCH_EPOCH:-0}" "$BOOT_EPOCH" "$pull" "${RUNPOD_TCP_PORT_22:-}" > "$R/env.json"
 
   # 3. Code on the container disk, never the volume.
   step code
@@ -117,19 +121,23 @@ main() {
     exit 0
   fi
 
-  # 4. venv on the volume keyed by image tag; reinstall when the requirement files change.
+  # 4. venv on the volume keyed by image tag + requirements hash. torch is pinned to the image's exact build (a dev
+  #    build in this image), so pip never pulls a second torch into the venv.
   step venv
   local image venv req
   image=$(sed -nE 's/^image: *"(.*)"$/\1/p' config/run_defaults.yaml)
-  venv=/workspace/venv/$(printf '%s' "$image" | tr -c 'A-Za-z0-9._-' '_')
-  req=$(cat pod/requirements.txt pod/constraints.txt | sha256sum | cut -c1-16)
+  { cat pod/constraints.txt; echo "torch==$(python3 -c 'import torch; print(torch.__version__)')"; } > /tmp/constraints.txt
+  req=$(cat pod/requirements.txt /tmp/constraints.txt | sha256sum | cut -c1-12)
+  venv=/workspace/venv/$(printf '%s' "$image" | tr -c 'A-Za-z0-9._-' '_')-$req
+  echo "constraints: $(grep -v '^#' /tmp/constraints.txt | tr '\n' ' ')"
   (
     flock 9
-    [ -f "$venv/.complete" ] || { rm -rf "$venv"; python3 -m venv --system-site-packages "$venv"; }
-    if [ "$(cat "$venv/.complete" 2>/dev/null)" != "$req" ]; then
-      "$venv/bin/pip" install -q --disable-pip-version-check -r pod/requirements.txt -c pod/constraints.txt < /dev/null
-      echo "$req" > "$venv/.complete"; echo "venv installed $venv"
-    else echo "venv cache hit $venv"; fi
+    if [ -f "$venv/.complete" ]; then echo "venv cache hit $venv"
+    else
+      rm -rf "$venv"; python3 -m venv --system-site-packages "$venv"
+      "$venv/bin/pip" install -q --disable-pip-version-check -r pod/requirements.txt -c /tmp/constraints.txt < /dev/null
+      touch "$venv/.complete"; echo "venv installed $venv"
+    fi
   ) 9> /workspace/.venv.lock
   # shellcheck disable=SC1091
   set +u; source "$venv/bin/activate"; set -u

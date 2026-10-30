@@ -1,2 +1,1 @@
-# torch comes from the pinned image (config/run_defaults.yaml); never let pip replace it.
-torch==2.8.0
+# Extra pins for pod/requirements.txt. bootstrap.sh appends torch==<the image's exact torch build> at runtime.

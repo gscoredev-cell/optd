@@ -159,12 +159,19 @@ def write_report(run_dir, m):
     boot = int(os.environ["BOOT_EPOCH"])
     elapsed = (time.time() - boot) / 60
     price = float(env["price_per_hr"])
+    pull = env.get("image_pull_sec", 0) / 60
+    port = env.get("ssh_public_port", "")
     m.update({"elapsed_min": round(elapsed, 2), "cost_usd": round(price * elapsed / 60, 3), "cache_hits": hits,
-              "downloads": len(got), "bootstrap_min": round((m["pipeline_start"] - boot) / 60, 2)})
+              "downloads": len(got), "bootstrap_min": round((m["pipeline_start"] - boot) / 60, 2),
+              "image_pull_min": round(pull, 2), "image_pull_cost_usd": round(price * pull / 60, 3),
+              "ssh_public_port": port or None})
     cap = ".".join(map(str, m["capability"]))
     lines = [
         f"RUN: {env['run_id']} | {env['phase']} | {env['git_sha'][:7]} | {env['pod_id']} | {env['gpu']} | "
         f"{m['vram_gb']} GB | {CFG['datacenter']} | ${price:.2f}/h | {elapsed:.1f} min | ${price * elapsed / 60:.2f}",
+        f"IMAGE PULL: {pull:.1f} min (pod create -> bootstrap start) | cost of pull ${price * pull / 60:.2f} | "
+        f"billed total est. {pull + elapsed:.1f} min ${price * (pull + elapsed) / 60:.2f}",
+        f"SSH: public port assigned {'yes (' + port + ')' if port else 'no'}",
         f"ENV: {CFG['image']} | torch {m['torch']} (cuda {m['cuda']}) | transformers {m['transformers']} | "
         f"peft {m['peft']} | {CFG['student'].split('/')[-1]} / {CFG['teacher'].split('/')[-1]} | "
         f"cache hits {hits} / downloads {len(got)} | download MB/s {mbps}",
