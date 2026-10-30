@@ -1,6 +1,6 @@
 # launch.ps1 -Phase <P> [-Seed n] [-MaxMinutes m] [-DeadlineEpoch e]   (§4.1; the overrides exist for the watchdog test)
 param(
-    [Parameter(Mandatory)][ValidateSet('ENVCHECK', 'SMOKE', 'FULL')][string]$Phase,
+    [Parameter(Mandatory)][ValidateSet('WATCHDOGTEST', 'ENVCHECK', 'SMOKE', 'FULL')][string]$Phase,
     [int]$Seed = 0, [int]$MaxMinutes = 0, [long]$DeadlineEpoch = 0
 )
 . "$PSScriptRoot/common.ps1"

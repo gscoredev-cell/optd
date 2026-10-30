@@ -27,8 +27,9 @@ on_exit() {
     [ -s "$R/.err" ] && msg=$(head -1 "$R/.err")
     write_status FAILED "$(cat "$R/.step")" "rc=$rc ${msg}"
   fi
-  echo "== exit rc=$rc; self-terminating"
   sleep 2; sync
+  if [ "$PHASE" = WATCHDOGTEST ]; then echo "== exit rc=$rc; WATCHDOGTEST: self-terminate skipped"; sleep infinity; fi
+  echo "== exit rc=$rc; self-terminating"
   terminate || echo "self-terminate failed; deadline watchdog will delete the pod"
   sleep infinity
 }
@@ -74,7 +75,6 @@ main() {
   # Deadline watchdog: absolute epoch, so a container restart does not reset the clock.
   ( set +e; while [ "$(date +%s)" -lt "$DEADLINE_EPOCH" ]; do sleep 60; done
     echo "== deadline watchdog: DEADLINE_EPOCH=$DEADLINE_EPOCH reached at $(date +%s); deleting pod"
-    write_status FAILED deadline "deadline watchdog"
     sync; terminate ) &
 
   # Restart-loop guard: a finished run never runs again.
@@ -109,6 +109,13 @@ main() {
   rm -rf /root/repo && mkdir /root/repo && cd /root/repo
   git init -q && git remote add origin "$GIT_REPO"
   git fetch -q --depth 1 origin "$GIT_SHA" && git checkout -q FETCH_HEAD
+
+  # WATCHDOGTEST: no venv, no downloads (shared volume untouched), no timeout; only DEADLINE_EPOCH can end the pod.
+  if [ "$PHASE" = WATCHDOGTEST ]; then
+    step pipeline
+    python3 pipeline/run_phase.py --phase "$PHASE" --run-id "$RUN_ID" --seed "${SEED:-0}" --tier "$tier" < /dev/null
+    exit 0
+  fi
 
   # 4. venv on the volume keyed by image tag; reinstall when the requirement files change.
   step venv

@@ -7,13 +7,35 @@
       "Bash(runpodctl gpu list*)", "Bash(runpodctl datacenter list*)",
       "Bash(aws --profile runpod s3 *)",
       "Bash(git status*)", "Bash(git add*)", "Bash(git commit*)", "Bash(git log*)", "Bash(git diff*)", "Bash(git push origin main)",
-      "Bash(python pipeline/*)", "Bash(python -m pytest*)"
+      "Bash(python pipeline/*)", "Bash(python -m pytest*)",
+
+      "PowerShell(pwsh -ExecutionPolicy Bypass -File orchestrator/*)",
+      "PowerShell(runpodctl pod list*)", "PowerShell(runpodctl pod get*)", "PowerShell(runpodctl pod delete*)",
+      "PowerShell(runpodctl gpu list*)", "PowerShell(runpodctl datacenter list*)",
+      "PowerShell(aws --profile runpod s3 *)",
+      "PowerShell(git status*)", "PowerShell(git add*)", "PowerShell(git commit*)", "PowerShell(git log*)", "PowerShell(git diff*)", "PowerShell(git push origin main)",
+      "PowerShell(python pipeline/*)", "PowerShell(python -m pytest*)"
     ],
     "deny": [
       "Bash(runpodctl pod create*)", "Bash(runpodctl pod start*)", "Bash(runpodctl pod stop*)",
       "Bash(git push -f*)", "Bash(git push --force*)", "Bash(git push * +*)",
       "Bash(env*)", "Bash(set*)", "Bash(printenv*)", "Bash(python -c*)",
+      "Bash(*RUNPOD_API_KEY*)",
+
+      "PowerShell(runpodctl pod create*)", "PowerShell(runpodctl pod start*)", "PowerShell(runpodctl pod stop*)",
+      "PowerShell(git push -f*)", "PowerShell(git push --force*)", "PowerShell(git push * +*)",
+      "PowerShell(env*)", "PowerShell(set*)", "PowerShell(printenv*)", "PowerShell(python -c*)",
+      "PowerShell(Get-ChildItem env:*)", "PowerShell(gci env:*)", "PowerShell(ls env:*)", "PowerShell(dir env:*)",
+      "PowerShell(Get-Item env:*)", "PowerShell(gi env:*)", "PowerShell(Get-Content env:*)", "PowerShell(cat env:*)",
+      "PowerShell(Get-Variable*)", "PowerShell(gv*)",
+
       "Read(./.env)", "Read(./.env.*)", "Read(~/.aws/**)", "Read(~/.ssh/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash|PowerShell",
+        "hooks": [ { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/deny_secrets.js\"" } ] }
     ]
   }
 }

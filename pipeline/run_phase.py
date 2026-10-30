@@ -11,11 +11,9 @@ import pathlib
 import time
 
 import torch
-import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-CFG = yaml.safe_load((ROOT / "config/run_defaults.yaml").read_text())
-TIERS = yaml.safe_load((ROOT / "config/gpu_tiers.yaml").read_text())["tiers"]
+CFG = TIERS = None   # loaded in main(); WATCHDOGTEST runs on the image's python3 without the venv
 SYSTEM = ("Solve the problem step by step. Write each step on its own line. "
           "End with exactly one line: The final answer is <number>")
 MAX_NEW = 400
@@ -210,6 +208,7 @@ def run_stage(run_dir, name, fn, metrics):
 
 
 def main():
+    global CFG, TIERS
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", required=True)
     ap.add_argument("--run-id", required=True)
@@ -217,6 +216,14 @@ def main():
     ap.add_argument("--tier", type=int, required=True)
     a = ap.parse_args()
     run_dir = pathlib.Path("/workspace/runs") / a.run_id
+    if a.phase == "WATCHDOGTEST":   # only the in-pod deadline watchdog may end this pod
+        write_status(run_dir, "watchdogtest_sleep")
+        print("== WATCHDOGTEST: sleeping 30 min")
+        time.sleep(1800)
+        return
+    import yaml
+    CFG = yaml.safe_load((ROOT / "config/run_defaults.yaml").read_text())
+    TIERS = yaml.safe_load((ROOT / "config/gpu_tiers.yaml").read_text())["tiers"]
     try:
         if a.phase != "ENVCHECK":
             raise NotImplementedError(f"phase {a.phase} is not implemented yet")

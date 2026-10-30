@@ -10,8 +10,8 @@ s3_region: "us-ks-2"
 git_repo: "https://github.com/gscoredev-cell/optd"
 git_raw: "https://raw.githubusercontent.com/gscoredev-cell/optd"
 gpu_order: ["NVIDIA A40", "NVIDIA RTX A6000", "NVIDIA L40", "NVIDIA L40S", "NVIDIA RTX PRO 4500 Blackwell Server Edition", "NVIDIA GeForce RTX 4090", "NVIDIA L4", "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", "NVIDIA GeForce RTX 3090", "NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"]
-phase_budget_usd: {"ENVCHECK": 1, "SMOKE": 4, "FULL": 10}
-phase_ceiling_min: {"ENVCHECK": 30, "SMOKE": 180, "FULL": 900}
+phase_budget_usd: {"WATCHDOGTEST": 1, "ENVCHECK": 1, "SMOKE": 4, "FULL": 10}
+phase_ceiling_min: {"WATCHDOGTEST": 10, "ENVCHECK": 30, "SMOKE": 180, "FULL": 900}
 deadline_grace_min: 20
 student: "Qwen/Qwen3-1.7B"
 teacher: "Qwen/Qwen3-8B"
