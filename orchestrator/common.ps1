@@ -40,10 +40,12 @@ function Get-Pod([string]$Id) {   # $null once the pod is gone
 }
 # Server time: the PC clock drifted 190 s slow on 2026-10-30, which shrank every deadline. Offset from the S3
 # endpoint's Date header (1 s resolution), measured once per script.
-$ClockOffset = try {
-    $d = (Invoke-WebRequest -Method Head -Uri $Cfg.s3_endpoint -SkipHttpErrorCheck -TimeoutSec 10).Headers.Date[0]
-    [DateTimeOffset]::Parse($d, $Inv).ToUnixTimeSeconds() - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-} catch { Write-Warning "server time unavailable, using the local clock: $($_.Exception.Message)"; 0 }
+$ClockOffset = & {   # own scope: nothing leaks into scripts that dot-source this file
+    try {
+        $date = (Invoke-WebRequest -Method Head -Uri $Cfg.s3_endpoint -SkipHttpErrorCheck -TimeoutSec 10).Headers.Date[0]
+        [DateTimeOffset]::Parse($date, $Inv).ToUnixTimeSeconds() - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    } catch { Write-Warning "server time unavailable, using the local clock: $($_.Exception.Message)"; 0 }
+}
 if ([math]::Abs($ClockOffset) -gt 30) { Write-Warning "local clock is off by $ClockOffset s; using server time (resync Windows time)" }
 function Get-Epoch { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $ClockOffset }
 function ConvertTo-Epoch($v) {   # ISO or Go-style ("... +0000 UTC") timestamps; $null if unparseable
