@@ -18,13 +18,22 @@ $Cfg = Get-Config
 $S3 = @('--profile', 'runpod', '--endpoint-url', $Cfg.s3_endpoint, '--region', $Cfg.s3_region)
 $Bucket = "s3://$($Cfg.network_volume_id)"
 
+# Objects go through s3api: `aws s3 cp/sync` downloads fail RunPod's signature check (SignatureDoesNotMatch), listing works.
+function Save-S3File([string]$Key, [string]$Path) {
+    aws @S3 s3api get-object --bucket $Cfg.network_volume_id --key $Key $Path 2>$null | Out-Null
+    $LASTEXITCODE -eq 0
+}
+function Send-S3File([string]$Path, [string]$Key) {
+    aws @S3 s3api put-object --bucket $Cfg.network_volume_id --key $Key --body $Path 2>$null | Out-Null
+    $LASTEXITCODE -eq 0
+}
 function Get-S3Text([string]$Key) {
-    $t = (& aws @S3 s3 cp "$Bucket/$Key" - 2>$null) -join "`n"
-    if ($LASTEXITCODE -ne 0) { return $null }
-    $t
+    $tmp = [IO.Path]::GetTempFileName()
+    try { if (Save-S3File $Key $tmp) { Get-Content -Raw $tmp } else { $null } } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
 }
 function ConvertFrom-JsonOrNull($t) { if (-not $t) { return $null }; try { $t | ConvertFrom-Json } catch { $null } }
-function Get-Pods { @(runpodctl pod list -o json | ConvertFrom-Json) }
+# --all: the default list hides pods that are still pulling their image (seen in the watchdog test).
+function Get-Pods { @(runpodctl pod list --all -o json | ConvertFrom-Json) }
 function Get-Pod([string]$Id) {   # $null once the pod is gone
     $p = ConvertFrom-JsonOrNull ((runpodctl pod get $Id -o json 2>&1) -join "`n")
     if ($p.id -and -not $p.error) { $p } else { $null }

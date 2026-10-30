@@ -2,11 +2,11 @@
 param([Parameter(Mandatory)][string]$RunId)
 . "$PSScriptRoot/common.ps1"
 $runDir = Join-Path $Root "runs/$RunId"
-$files = 'report.md', 'metrics.json', 'status.json', 'log.txt', 'env.json', 'pod.json'
-$inc = $files | ForEach-Object { '--include', $_ }
-aws @S3 s3 sync "$Bucket/runs/$RunId" $runDir --exclude '*' @inc --only-show-errors
-if ($LASTEXITCODE -ne 0) { throw "s3 sync failed ($LASTEXITCODE)" }
-Get-ChildItem $runDir -File | ForEach-Object { '{0,-14} {1,8} B' -f $_.Name, $_.Length }
+New-Item -ItemType Directory -Force $runDir | Out-Null
+foreach ($f in 'report.md', 'metrics.json', 'status.json', 'log.txt', 'env.json', 'pod.json') {
+    if (Save-S3File "runs/$RunId/$f" (Join-Path $runDir $f)) { '{0,-14} {1,8} B' -f $f, (Get-Item (Join-Path $runDir $f)).Length }
+    else { '{0,-14} missing on volume' -f $f }
+}
 
 $pod = Get-Content (Join-Path $runDir 'pod.json') -Raw | ConvertFrom-Json
 $status = ConvertFrom-JsonOrNull (Get-Content (Join-Path $runDir 'status.json') -Raw -ErrorAction SilentlyContinue)

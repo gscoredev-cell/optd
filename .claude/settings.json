@@ -24,7 +24,7 @@
 
       "PowerShell(runpodctl pod create*)", "PowerShell(runpodctl pod start*)", "PowerShell(runpodctl pod stop*)",
       "PowerShell(git push -f*)", "PowerShell(git push --force*)", "PowerShell(git push * +*)",
-      "PowerShell(env*)", "PowerShell(set*)", "PowerShell(printenv*)", "PowerShell(python -c*)",
+      "PowerShell(env)", "PowerShell(env *)", "PowerShell(set)", "PowerShell(set *)", "PowerShell(printenv*)", "PowerShell(python -c*)",
       "PowerShell(Get-ChildItem env:*)", "PowerShell(gci env:*)", "PowerShell(ls env:*)", "PowerShell(dir env:*)",
       "PowerShell(Get-Item env:*)", "PowerShell(gi env:*)", "PowerShell(Get-Content env:*)", "PowerShell(cat env:*)",
       "PowerShell(Get-Variable*)", "PowerShell(gv*)",

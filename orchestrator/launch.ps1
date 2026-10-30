@@ -50,9 +50,21 @@ function Start-Pod($g) {
         if (-not $p.id) { $p = Get-Pod $kept.id }
         return @{ pod = $p; gpu = $g; max = $max; deadline = $deadline; name = $name }
     }
-    # Failed: a kept pod (e.g. --wait timeout) is killed; capacity errors move to the next GPU; anything else stops.
-    if ($kept) {
-        & "$PSScriptRoot/kill.ps1" $kept.id | Out-Host
+    # Failed: a kept pod (e.g. --wait timeout; the error JSON carries its id) is killed; capacity errors move to the
+    # next GPU; anything else stops.
+    $errId = ($res | ForEach-Object { ConvertFrom-JsonOrNull "$_" } | Where-Object { $_.id } | Select-Object -Last 1).id
+    if ($errId -and $out -match 'no longer listed') {
+        # runpodctl --wait reads the default pod list, which hides pods still pulling their image; keep waiting via pod get.
+        "--wait lost the pod while it was initializing; waiting via pod get" | Out-Host
+        $until = (Get-Date).AddMinutes(10)
+        while ((Get-Date) -lt $until -and ($p = Get-Pod $errId)) {
+            if ($p.publicIp -and $p.portMappings.'22') { return @{ pod = $p; gpu = $g; max = $max; deadline = $deadline; name = $name } }
+            Start-Sleep -Seconds 15
+        }
+    }
+    $keptId = if ($kept) { $kept.id } elseif ($errId -and (Get-Pod $errId)) { $errId }
+    if ($keptId) {
+        & "$PSScriptRoot/kill.ps1" $keptId | Out-Host
         throw "FAILED: no ssh ($runId): $out"
     }
     if ($out -match '(?i)instances available|not available|no longer any|capacity|out of stock|insufficient|no gpu') {
@@ -78,6 +90,6 @@ $podJson = [ordered]@{
     max_minutes = $r.max; deadline_epoch = $r.deadline
 } | ConvertTo-Json
 $podJson | Set-Content (Join-Path $runDir 'pod.json')
-aws @S3 s3 cp (Join-Path $runDir 'pod.json') "$Bucket/runs/$runId/pod.json" --only-show-errors
+if (-not (Send-S3File (Join-Path $runDir 'pod.json') "runs/$runId/pod.json")) { Write-Warning 'pod.json upload to the volume failed' }
 $local = [DateTimeOffset]::FromUnixTimeSeconds($r.deadline).LocalDateTime
 "RUN_ID=$runId  pod=$($p.id)  gpu=$($r.gpu.gpuId)  `$/h=$($r.gpu.pricePerHr.ToString($Inv))  max_minutes=$($r.max)  deadline=$local (local)"
