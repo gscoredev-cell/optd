@@ -147,7 +147,8 @@ Image: pin one exact tag in `config/run_defaults.yaml`. Default `runpod/pytorch:
 
 ### 8.3 Prompt and scoring
 - System: "Solve the problem step by step. Write each step on its own line. End with exactly one line: `The final answer is <number>`." User: question.
-- Greedy first attempts; retries `temperature=0.8, top_p=0.95`; `max_new_tokens=400`; left padding; batch per tier.
+- Greedy first attempts; retries `temperature=0.8, top_p=0.95`; `max_new_tokens=640` for first attempts and retries (config `max_new_tokens`; raised from 400 on 2026-10-30 after the ENVCHECK truncation check: 8/24 traces hit 400 tokens, all long but progressing, no repetition loops); no `no_repeat_ngram_size`, no `repetition_penalty`; system prompt unchanged; left padding; batch per tier.
+- Truncation rule (SMOKE): S1 reports the strict truncation rate per set (main, p1, p2, RandomCalculation) for student and teacher. If any set exceeds 10%, rerun S1 only at `max_new_tokens=800` and use 800 for the rest of SMOKE; report.md records both rates.
 - Scoring: **strict** = number after "The final answer is" (missing → wrong); **lenient** = strict, else last number. Report both plus the truncation rate (hit 400 tokens). Gates use strict.
 
 ## 9. Method

@@ -1,69 +1,32 @@
-"""One long-lived process per phase (OPTION_D_SPEC.md §13). Implemented so far: ENVCHECK.
+"""One long-lived process per phase (OPTION_D_SPEC.md §13): ENVCHECK, SMOKE (and WATCHDOGTEST for the deadline test).
 
 Each stage writes runs/<RUN_ID>/stage_<name>/ and is skipped on restart once its .done marker exists.
 Never prints or stores question text, secrets or environment dumps.
 """
 import argparse
-import gc
 import json
-import os
 import pathlib
+import sys
 import time
 
 import torch
 
+from core import write_status
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-CFG = TIERS = None   # loaded in main(); WATCHDOGTEST runs on the image's python3 without the venv
-SYSTEM = ("Solve the problem step by step. Write each step on its own line. "
-          "End with exactly one line: The final answer is <number>")
-MAX_NEW = 400
 EMPTY_THINK = "<think>\n\n</think>\n\n"
 
 
-def write_status(run_dir, step):
-    (run_dir / ".step").write_text(step)
-    tmp = run_dir / f".status.py.{os.getpid()}"
-    tmp.write_text(json.dumps({"run_id": run_dir.name, "state": "RUNNING", "step": step, "msg": "",
-                               "ts": int(time.time())}, separators=(",", ":")))
-    os.replace(tmp, run_dir / "status.json")
-
-
-def model_dir(repo):
-    return pathlib.Path("/workspace/models") / repo.split("/")[-1]
-
-
-def gsm(config):
+def gsm_rows(cfg, config):
     from huggingface_hub import snapshot_download
-    root = pathlib.Path(snapshot_download(CFG["dataset"], repo_type="dataset", local_files_only=True))
-    return [json.loads(l) for l in (root / config / "test.jsonl").read_text().splitlines() if l.strip()]
+    import data
+    return data.load_gsm(snapshot_download(cfg["dataset"], repo_type="dataset", local_files_only=True))[config]
 
 
-def messages(question):
-    return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
-
-
-def chat(tok, question, tokenize=False):
-    return tok.apply_chat_template(messages(question), tokenize=tokenize, add_generation_prompt=True,
-                                   enable_thinking=False)
-
-
-def tokenizer(repo):
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_dir(repo))
-    tok.padding_side = "left"
-    return tok
-
-
-def load(repo):
-    from transformers import AutoModelForCausalLM
-    return AutoModelForCausalLM.from_pretrained(model_dir(repo), dtype=torch.bfloat16,
-                                                attn_implementation="sdpa").to("cuda").eval()
-
-
-def unload(model):
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+def chat_text(tok, question):
+    from core import SYSTEM
+    return tok.apply_chat_template([{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}],
+                                   tokenize=False, add_generation_prompt=True, enable_thinking=False)
 
 
 def stage_env(d):
@@ -82,30 +45,32 @@ def stage_env(d):
             "vram_gb": round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1)}
 
 
-def stage_templates(d):
-    ts, tt = tokenizer(CFG["student"]), tokenizer(CFG["teacher"])
-    questions = [r["question"] for r in gsm("main")[:20]]
-    same_ids = sum(chat(ts, q, True) == chat(tt, q, True) for q in questions)
-    think = sum(chat(ts, q).endswith(EMPTY_THINK) and chat(ts, q) == chat(tt, q) for q in questions)
+def stage_templates(d, cfg):
+    from generate import load_tokenizer, prompt_ids
+    ts, tt = load_tokenizer(cfg["student"]), load_tokenizer(cfg["teacher"])
+    questions = [r["question"] for r in gsm_rows(cfg, "main")[:20]]
+    same_ids = sum(prompt_ids(ts, q) == prompt_ids(tt, q) for q in questions)
+    think = sum(chat_text(ts, q).endswith(EMPTY_THINK) and chat_text(ts, q) == chat_text(tt, q) for q in questions)
     assert same_ids == 20, f"student/teacher token ids differ on {20 - same_ids}/20 prompts"
     assert think == 20, f"empty think block missing or different on {20 - think}/20 prompts"
     return {"template_identical_ids": same_ids, "template_empty_think": think, "template_n": 20}
 
 
-def stage_gen(d, tier):
-    tok = tokenizer(CFG["student"])
-    bs = TIERS[tier]["gen_batch"]
-    enc = tok([chat(tok, r["question"]) for r in gsm("p2")[:bs]], return_tensors="pt", padding=True,
+def stage_gen(d, cfg, tiers, tier):
+    from generate import load_model, load_tokenizer
+    tok = load_tokenizer(cfg["student"])
+    bs = tiers[tier]["gen_batch"]
+    enc = tok([chat_text(tok, r["question"]) for r in gsm_rows(cfg, "p2")[:bs]], return_tensors="pt", padding=True,
               add_special_tokens=False).to("cuda")
-    model = load(CFG["student"])
+    model = load_model(cfg["student"])
     eos = model.generation_config.eos_token_id
     eos = set(eos if isinstance(eos, list) else [eos])
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     t0 = time.time()
     with torch.no_grad():
-        out = model.generate(**enc, max_new_tokens=MAX_NEW, do_sample=False, temperature=None, top_p=None,
-                             top_k=None, pad_token_id=tok.pad_token_id)
+        out = model.generate(**enc, max_new_tokens=cfg["max_new_tokens"], do_sample=False, temperature=None,
+                             top_p=None, top_k=None, pad_token_id=tok.pad_token_id)
     torch.cuda.synchronize()
     sec = time.time() - t0
     plen = enc.input_ids.shape[1]
@@ -114,22 +79,24 @@ def stage_gen(d, tier):
     torch.save({"input_ids": out.cpu(), "prompt_mask": enc.attention_mask.cpu(), "prompt_len": plen,
                 "lengths": lengths}, d / "gen.pt")
     peak = torch.cuda.max_memory_allocated() / 2**30
-    unload(model)
+    del model
+    torch.cuda.empty_cache()
     return {"gen_batch": bs, "gen_tokens": sum(lengths), "gen_sec": round(sec, 2),
             "gen_tok_per_s": round(sum(lengths) / sec, 1), "gen_truncated": truncated,
             "gen_peak_vram_gb": round(peak, 1)}
 
 
-def stage_teacher_prefill(d, tier, gen_dir):
+def stage_teacher_prefill(d, cfg, tiers, tier, gen_dir):
+    from generate import load_model
     g = torch.load(gen_dir / "gen.pt")
-    bs = TIERS[tier]["teacher_prefill_batch"]
+    bs = tiers[tier]["teacher_prefill_batch"]
     plen, lengths = g["prompt_len"], g["lengths"][:bs]
     width = plen + max(lengths)
     ids = g["input_ids"][:bs, :width].cuda()
     gen_mask = (torch.arange(width - plen)[None, :] < torch.tensor(lengths)[:, None]).long()
     mask = torch.cat([g["prompt_mask"][:bs], gen_mask], dim=1).cuda()
     pos = (mask.cumsum(-1) - 1).clamp(min=0)   # left padding: positions as during generation
-    model = load(CFG["teacher"])
+    model = load_model(cfg["teacher"])
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     t0 = time.time()
@@ -142,58 +109,12 @@ def stage_teacher_prefill(d, tier, gen_dir):
               .gather(-1, ids[i, plen:plen + n, None]).mean().item() for i, n in enumerate(lengths)]
     peak = torch.cuda.max_memory_allocated() / 2**30
     tokens = int(mask.sum())
-    del logits
-    unload(model)
+    del logits, model
+    torch.cuda.empty_cache()
     assert all(map(lambda x: x == x and abs(x) < 1e4, lp)), "non-finite teacher log-probs"
     return {"prefill_batch": bs, "prefill_tokens": tokens, "prefill_sec": round(sec, 3),
             "prefill_tok_per_s": round(tokens / sec, 1), "teacher_mean_logp": round(sum(lp) / len(lp), 3),
             "prefill_peak_vram_gb": round(peak, 1)}
-
-
-def write_report(run_dir, m):
-    env = json.loads((run_dir / "env.json").read_text())
-    dl = [json.loads(l) for l in (run_dir / "downloads.jsonl").read_text().splitlines() if l.strip()]
-    hits = sum(x["cache"] == "hit" for x in dl)
-    got = [x for x in dl if x["cache"] == "download"]
-    mbps = f"{sum(x['mb'] for x in got) / max(sum(x['sec'] for x in got), 1e-3):.1f}" if got else "n/a (all cache hits)"
-    boot = int(os.environ["BOOT_EPOCH"])
-    elapsed = (time.time() - boot) / 60
-    price = float(env["price_per_hr"])
-    pull = env.get("image_pull_sec", 0) / 60
-    port = env.get("ssh_public_port", "")
-    m.update({"elapsed_min": round(elapsed, 2), "cost_usd": round(price * elapsed / 60, 3), "cache_hits": hits,
-              "downloads": len(got), "bootstrap_min": round((m["pipeline_start"] - boot) / 60, 2),
-              "image_pull_min": round(pull, 2), "image_pull_cost_usd": round(price * pull / 60, 3),
-              "ssh_public_port": port or None})
-    cap = ".".join(map(str, m["capability"]))
-    lines = [
-        f"RUN: {env['run_id']} | {env['phase']} | {env['git_sha'][:7]} | {env['pod_id']} | {env['gpu']} | "
-        f"{m['vram_gb']} GB | {CFG['datacenter']} | ${price:.2f}/h | {elapsed:.1f} min | ${price * elapsed / 60:.2f}",
-        f"IMAGE PULL: {pull:.1f} min (pod create -> bootstrap start) | cost of pull ${price * pull / 60:.2f} | "
-        f"billed total est. {pull + elapsed:.1f} min ${price * (pull + elapsed) / 60:.2f}",
-        f"SSH: public port assigned {'yes (' + port + ')' if port else 'no'}",
-        f"ENV: {CFG['image']} | torch {m['torch']} (cuda {m['cuda']}) | transformers {m['transformers']} | "
-        f"peft {m['peft']} | {CFG['student'].split('/')[-1]} / {CFG['teacher'].split('/')[-1]} | "
-        f"cache hits {hits} / downloads {len(got)} | download MB/s {mbps}",
-        f"DEVICE: capability {cap} | bf16 matmul ok (rel err {m['bf16_matmul_rel_err']}) | tier {env['tier']} | "
-        f"driver {env['driver']}",
-        f"TEMPLATES: identical token ids {m['template_identical_ids']}/{m['template_n']} | "
-        f"empty think block {m['template_empty_think']}/{m['template_n']}",
-        f"TIMING (min): bootstrap {m['bootstrap_min']} | env {m['env_min']} | templates {m['templates_min']} | "
-        f"gen {m['gen_min']} | teacher_prefill {m['teacher_prefill_min']} | total {elapsed:.2f}",
-        f"THROUGHPUT: gen tok/s {m['gen_tok_per_s']} (batch {m['gen_batch']}, {m['gen_tokens']} tokens, "
-        f"truncated {m['gen_truncated']}/{m['gen_batch']}, peak {m['gen_peak_vram_gb']} GB) | "
-        f"teacher prefill tok/s {m['prefill_tok_per_s']} (batch {m['prefill_batch']}, {m['prefill_tokens']} tokens, "
-        f"peak {m['prefill_peak_vram_gb']} GB, mean logp {m['teacher_mean_logp']})",
-        "DOWNLOADS: " + " ; ".join(f"{x['repo']} cache hit" if x["cache"] == "hit"
-                                   else f"{x['repo']} {x['mb']} MB {x['mb_per_s']} MB/s" for x in dl),
-        f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} "
-        f"<= ${CFG['phase_budget_usd'][env['phase']]}",
-        "BLOCKERS: none",
-    ]
-    (run_dir / "report.md").write_text("\n".join(lines) + "\n")
-    (run_dir / "metrics.json").write_text(json.dumps(m, indent=1))
-    print("\n".join(lines))
 
 
 def run_stage(run_dir, name, fn, metrics):
@@ -208,14 +129,13 @@ def run_stage(run_dir, name, fn, metrics):
     t0 = time.time()
     m = fn(d)
     m[f"{name}_min"] = round((time.time() - t0) / 60, 2)
-    (d / "metrics.json").write_text(json.dumps(m, indent=1))
+    (d / "metrics.json").write_text(json.dumps(m, indent=1, default=str))
     (d / ".done").touch()
     metrics.update(m)
-    print(json.dumps(m))
+    print(json.dumps({k: v for k, v in m.items() if not isinstance(v, (dict, list))}, default=str))
 
 
 def main():
-    global CFG, TIERS
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", required=True)
     ap.add_argument("--run-id", required=True)
@@ -229,23 +149,33 @@ def main():
         time.sleep(1800)
         return
     import yaml
-    CFG = yaml.safe_load((ROOT / "config/run_defaults.yaml").read_text())
-    TIERS = yaml.safe_load((ROOT / "config/gpu_tiers.yaml").read_text())["tiers"]
+    import report
+    cfg = yaml.safe_load((ROOT / "config/run_defaults.yaml").read_text())
+    tiers = yaml.safe_load((ROOT / "config/gpu_tiers.yaml").read_text())["tiers"]
     try:
-        if a.phase != "ENVCHECK":
-            raise NotImplementedError(f"phase {a.phase} is not implemented yet")
         m = {"pipeline_start": time.time()}
         run_stage(run_dir, "env", stage_env, m)
-        run_stage(run_dir, "templates", stage_templates, m)
-        run_stage(run_dir, "gen", lambda d: stage_gen(d, a.tier), m)
-        run_stage(run_dir, "teacher_prefill",
-                  lambda d: stage_teacher_prefill(d, a.tier, run_dir / "stage_gen"), m)
-        write_status(run_dir, "report")
-        write_report(run_dir, m)
+        run_stage(run_dir, "templates", lambda d: stage_templates(d, cfg), m)
+        if a.phase == "ENVCHECK":
+            run_stage(run_dir, "gen", lambda d: stage_gen(d, cfg, tiers, a.tier), m)
+            run_stage(run_dir, "teacher_prefill",
+                      lambda d: stage_teacher_prefill(d, cfg, tiers, a.tier, run_dir / "stage_gen"), m)
+            write_status(run_dir, "report")
+            report.envcheck(run_dir, m, cfg)
+        elif a.phase == "SMOKE":
+            import smoke
+            ctx = smoke.Ctx(cfg, tiers, a.tier, a.run_id, run_dir)
+            for name, fn in smoke.STAGES:
+                run_stage(run_dir, name, lambda d, fn=fn: fn(ctx, d), m)
+            write_status(run_dir, "report")
+            report.smoke(run_dir, m, cfg)
+        else:
+            raise NotImplementedError(f"phase {a.phase} is not implemented (FULL needs human approval of SMOKE)")
     except BaseException as e:
         (run_dir / ".err").write_text(f"{type(e).__name__}: {(str(e).splitlines() or [''])[0]}"[:300])
         raise
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     main()

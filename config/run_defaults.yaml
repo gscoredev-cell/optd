@@ -17,3 +17,4 @@ student: "Qwen/Qwen3-1.7B"
 teacher: "Qwen/Qwen3-8B"
 models_min_gb: {"Qwen/Qwen3-1.7B": 3.9, "Qwen/Qwen3-8B": 16.0}
 dataset: "apple/GSM-Symbolic"
+max_new_tokens: 640
