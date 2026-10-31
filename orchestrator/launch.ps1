@@ -2,7 +2,7 @@
 # Success = runs/<RUN_ID>/status.json appears on the volume within 10 min of creation. SSH is debugging-only: no --wait,
 # ip/port are recorded when pod get shows them, never required. Exit 0 ok, 2 FAILED: no heartbeat, 3 NO_CAPACITY.
 param(
-    [Parameter(Mandatory)][ValidateSet('WATCHDOGTEST', 'ENVCHECK', 'SMOKE', 'SMOKE3', 'SMOKE4', 'FULL')][string]$Phase,
+    [Parameter(Mandatory)][ValidateSet('WATCHDOGTEST', 'ENVCHECK', 'SMOKE', 'SMOKE3', 'SMOKE4', 'SMOKE5', 'FULL')][string]$Phase,
     [int]$Seed = 0, [int]$MaxMinutes = 0, [long]$DeadlineEpoch = 0
 )
 . "$PSScriptRoot/common.ps1"
@@ -66,9 +66,12 @@ function Start-Pod($g) {
 }
 
 $r = $null
+$only = if ($Cfg.phase_gpu_order -and $Cfg.phase_gpu_order[$Phase]) { @($Cfg.phase_gpu_order[$Phase]) } else { @() }   # a phase may restrict the GPUs and their order (SMOKE5: A100s, then L40)
 for ($round = 0; -not $r -and $round -le 4; $round++) {
     if ($round) { Log "no capacity in list; retry $round/4 in 15 min"; Start-Sleep -Seconds 900 }
-    foreach ($g in (& "$PSScriptRoot/gputypes.ps1" -PassThru)) { if ($r = Start-Pod $g) { break } }
+    $cands = @(& "$PSScriptRoot/gputypes.ps1" -PassThru)
+    if ($only.Count) { $cands = @($cands | Where-Object { $only -contains $_.gpuId } | Sort-Object { $only.IndexOf($_.gpuId) }) }
+    foreach ($g in $cands) { if ($r = Start-Pod $g) { break } }
 }
 if (-not $r) { Log "NO_CAPACITY ($runId)"; exit 3 }
 

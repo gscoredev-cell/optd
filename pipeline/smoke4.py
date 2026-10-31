@@ -79,12 +79,12 @@ def contested(ts):
     return 0 < sum(t["ok"] for t in ts) < len(ts)
 
 
-def phat_dist(traces, split):
+def phat_dist(traces, split, sets=("p1", "p2", "main")):
     """{split_set: {problems, hist of #correct of K, accuracy, contested share}}, plus each split's sets pooled."""
     bp = by_problem(traces)
     out = {}
     for sp in ("train", "test"):
-        for s in ("p1", "p2", "main", None):
+        for s in (*sets, None):
             ps = [ts for p, ts in bp.items() if split[p] == sp and (s is None or ts[0]["set"] == s)]
             if not ps:
                 continue

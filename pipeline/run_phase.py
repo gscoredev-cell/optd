@@ -1,4 +1,4 @@
-"""One long-lived process per phase (OPTION_D_SPEC.md §13): ENVCHECK, SMOKE, SMOKE3/SMOKE4 diagnostics (and
+"""One long-lived process per phase (OPTION_D_SPEC.md §13): ENVCHECK, SMOKE, SMOKE3/4/5 diagnostics (and
 WATCHDOGTEST for the deadline test).
 
 Each stage writes runs/<RUN_ID>/stage_<name>/ and is skipped on restart once its .done marker exists.
@@ -170,11 +170,11 @@ def main():
                 run_stage(run_dir, name, lambda d, fn=fn: fn(ctx, d), m)
             write_status(run_dir, "report")
             report.smoke(run_dir, m, cfg)
-        elif a.phase in ("SMOKE3", "SMOKE4"):
+        elif a.phase in ("SMOKE3", "SMOKE4", "SMOKE5"):
             import importlib
             import smoke
             mod = importlib.import_module(a.phase.lower())
-            c3 = (mod.Ctx3 if a.phase == "SMOKE3" else mod.Ctx4)(cfg, tiers, a.tier, a.run_id, run_dir)
+            c3 = getattr(mod, f"Ctx{a.phase[-1]}")(cfg, tiers, a.tier, a.run_id, run_dir)
             for name, fn in mod.STAGES:   # diagnostic parts are independent: a failing one must not cost the report
                 try:
                     run_stage(run_dir, name, lambda d, fn=fn: fn(c3, d), m)

@@ -314,6 +314,137 @@ def smoke4(run_dir, m, cfg):
     _write(run_dir, lines, m)
 
 
+def _positions(by_pos):
+    return " ; ".join(f"{k}: {_n(v['auroc'])} (n {v['n']}" + (f", unrec {v['pos']})" if "pos" in v else ")")
+                      for k, v in sorted(by_pos.items(), key=lambda kv: int(kv[0])))
+
+
+def _trend(by_pos, min_n=10):
+    """One line: does AUROC rise with boundary position? Spearman rho over positions with n >= min_n; yes when
+    rho >= 0.5 and the mean over positions 5..12 exceeds the mean over 1..4 by >= 0.05."""
+    pts = sorted((int(k), v["auroc"]) for k, v in by_pos.items() if v["n"] >= min_n and not _bad(v["auroc"]))
+    if len(pts) < 3:
+        return f"rises with position: n/a (fewer than 3 positions with n >= {min_n})"
+    from scipy.stats import spearmanr
+    rho = float(spearmanr([k for k, _ in pts], [a for _, a in pts])[0])
+    early, late = [a for k, a in pts if k <= 4], [a for k, a in pts if k >= 5]
+    diff = sum(late) / len(late) - sum(early) / len(early) if early and late else float("nan")
+    verdict = "n/a" if _bad(diff) else "yes" if rho >= 0.5 and diff >= 0.05 else "no"
+    return (f"rises with position: {verdict} (Spearman rho {_n(rho, 2)} over positions "
+            f"{pts[0][0]}..{pts[-1][0]} with n >= {min_n}; mean 5..12 minus mean 1..4 = {_n(diff)})")
+
+
+def smoke5(run_dir, m, cfg):
+    env, _, lines = header(run_dir, m, {**cfg, "student": "Qwen/Qwen3-8B", "teacher": "none (not loaded)"})
+    price = m["price_per_hr"]
+    stages = ("D1", "D2", "D4a", "D3", "D4b")
+    skipped = {s: m.get(f"{s}_skipped") for s in stages if m.get(f"{s}_skipped")}
+    hm = " ; ".join(f"{s} {m[f'{s.lower()}_cache_hits']}/{m[f'{s.lower()}_cache_misses']}"
+                    for s in ("D1", "D3", "D4b") if f"{s.lower()}_cache_hits" in m)
+    lines += [
+        "STUDENT: Qwen3-8B, no teacher | features bf16 prefill, batch 8 | HF generate, T 0.8, top_p 0.95, cap 800",
+        "TIMING (min): " + " | ".join(f"{s} {m.get(f'{s}_min')}" for s in stages) + f" | total {m['elapsed_min']:.2f}",
+        f"GENERATION CACHE (/workspace/gencache, key model | prompt sha256 | T | top_p | seed, cap rule): seeded from "
+        f"SMOKE-2 S1 ({cfg['smoke3_source_run']}): {m.get('d1_seed_traces')} Qwen3-8B greedy traces, "
+        f"{m.get('d1_seed_imported')} new, {m.get('d1_seed_used')} are D1 problems (prompt ids identical "
+        f"{m.get('d1_seed_prompt_ids_same')}/{m.get('d1_seed_used')}) | hits/misses per stage: {hm or 'n/a'}",
+        "D1 MC STRATIFICATION (4 per problem; contested = 1..3 of 4 correct):",
+    ]
+    if "D1_skipped" in m:
+        lines.append(f"  {m['D1_skipped']}")
+    else:
+        lines.append(f"  problems {m['d1_problems']}/{m['d1_of']} | tok/s {_n(m['d1_tok_per_s'], 1)} (batch "
+                     f"{m['d1_bs']}, generated rows only) | truncation {_p(m['d1_trunc'])} | mean tokens "
+                     f"{_n(m['d1_mean_tokens'], 1)}")
+        for k, v in m["d1_dist"].items():
+            lines.append(f"  {k}: problems {v['problems']} | #correct of 4 (0..4) {v['hist']} | accuracy "
+                         f"{_p(v['acc'])} | contested {_p(v['contested'])}")
+        lines.append(f"  NOTE: test_p2 p_hat mixes 1 greedy (sample 0, SMOKE-2 S1 via the cache) + 3 sampled for "
+                     f"{m['d1_greedy0']} problems; not directly comparable with train_p2 (4 sampled)")
+    lines.append("D2 TARGET A, WITHIN-PROBLEM PROBE (one wrong + one correct per contested train problem; layer, C, "
+                 "pooling by grouped 5-fold CV on train groups; held-out = 20% of train groups):")
+    if "D2_skipped" in m or m.get("within_layers") is None:
+        lines.append(f"  {m.get('D2_skipped') or m.get('within_blocker', 'not run')} (pairs train "
+                     f"{m.get('within_train_pairs')}, held-out {m.get('within_heldout_pairs')})")
+    else:
+        lines += [
+            f"  pairs train {m['within_train_pairs']} | held-out {m['within_heldout_pairs']} | chosen: layer "
+            f"{m['within_layers']}, C {m['within_C']}, pooling {m['within_pool']} (cv {_n(m['within_cv_auroc'])}) | "
+            f"features {_n(m['d2_feat_sec'] / 60, 1)} min",
+            f"  held-out WITHIN-PROBLEM AUROC {_n(m['within_auroc'])} {_ci(m['within_ci'])} | pooled trace AUROC "
+            f"{_n(m['within_trace_auroc'])} | tau {_n(m['within_tau'], 4)} (FPR 10% on held-out contested correct): "
+            f"FPR {_p(m['within_heldout_fpr'])}, recall {_p(m['within_heldout_recall'])}",
+            "    by pooling (chosen layer): " + " ; ".join(f"{k} {_n(v['auroc'])} {_ci(v['ci'])}"
+                                                       for k, v in m["within_by_pool"].items()),
+            "    by layer (each at its best C; max / mean / last): " + " ; ".join(
+                f"{k} (C {v['C']}) {_n(v['max'])} / {_n(v['mean'])} / {_n(v['last'])}"
+                for k, v in m["within_by_layers"].items()),
+            "    by boundary position (held-out pairs): " + _positions(m["within_by_position"]),
+            "    " + _trend(m["within_by_position"]),
+            "    CV table (max / mean / last): " + " ; ".join(
+                f"{k} {_n(v['cv']['max'])}/{_n(v['cv']['mean'])}/{_n(v['cv']['last'])}"
+                for k, v in m["within_table"].items()),
+        ]
+    lines.append("D4a TEST, TARGET A (all traces of contested TEST problems; fresh pairs; tau from D2):")
+    if "D4a_skipped" in m:
+        lines.append(f"  {m['D4a_skipped']}")
+    else:
+        for k, v in m["d4a_test"].items():
+            lines.append(f"  {k}: problems {v['problems']} (correct {v['correct']}, wrong {v['wrong']}) | FPR "
+                         f"{_p(v['fpr'])} | recall {_p(v['recall'])} | within-pair AUROC {_n(v['within_auroc'])} "
+                         f"{_ci(v['within_ci'])} (pairs {v['pairs']})")
+        lines += ["  by boundary position (test pairs): " + _positions(m["d4a_by_position"]),
+                  "  " + _trend(m["d4a_by_position"])]
+    lines.append(f"D3 TARGET B, RECOVERABILITY (contested train pairs, 3 completions from the prompt and each boundary; "
+                 f"boundary unrecoverable = MC success < 0.5; boundary probe by grouped 5-fold CV, held-out = 20% of "
+                 f"groups):")
+    if "D3_skipped" in m:
+        lines.append(f"  {m['D3_skipped']}")
+    else:
+        lines.append(f"  traces {m['d3_traces']}/{m['d3_of']} | completions {m['d3_completions']} | tok/s "
+                     f"{_n(m['d3_tok_per_s'], 1)} | MC at prompt mean {_n(m['d3_mc_prompt_mean'])} | unrecoverable "
+                     f"boundaries: correct traces {_p(m['d3_unrec_share_correct'])}, wrong traces "
+                     f"{_p(m['d3_unrec_share_wrong'])}")
+        if m.get("d3_step_layers") is None:
+            lines.append(f"  probe: {m.get('d3_step_blocker', 'not fitted')}")
+        else:
+            lines += [
+                f"  probe: layer {m['d3_step_layers']}, C {m['d3_step_C']} (cv {_n(m['d3_step_cv_auroc'])}) | held-out "
+                f"boundary AUROC {_n(m['d3_step_auroc'])} (boundaries {m['d3_step_boundaries_heldout']}, unrecoverable "
+                f"{m['d3_step_pos_heldout']}) | tau {_n(m['d3_step_tau'], 4)} (FPR 10% on held-out recoverable)",
+                "    by layer (held-out at best C): " + " ; ".join(
+                    f"{k} {_n(v['heldout_auroc'])}" for k, v in m["d3_step_table"].items() if "heldout_auroc" in v),
+                "    by boundary position (held-out): " + _positions(m.get("d3_by_position", {})),
+                "    " + _trend(m.get("d3_by_position", {})),
+            ]
+        lines.append(f"  wrong traces {m['d3_wrong_traces']}: first point with MC < 0.25 (SMOKE-4 rule) | restart "
+                     f"share {_p(m['d3_restart_share'])} | never below 0.25 {_p(m['d3_never_share'])} | first drop "
+                     f"(0 = prompt) {m['d3_first_drop_hist']}")
+    lines.append("D4b TEST, TARGET B (contested TEST pairs with MC labels, 3 completions per point; tau from D3):")
+    if "D4b_skipped" in m:
+        lines.append(f"  {m['D4b_skipped']}")
+    else:
+        lines.append(f"  traces {m['d4b_traces']}/{m['d4b_of']} | completions {m['d4b_completions']} | tok/s "
+                     f"{_n(m['d4b_tok_per_s'], 1)}")
+        for k, v in m["d4b_test"].items():
+            lines.append(f"  {k}: traces {v['traces']} | boundaries {v['boundaries']} (unrecoverable {v['unrec']}) | "
+                         f"boundary AUROC {_n(v['auroc'])} | FPR {_p(v['fpr'])} | recall {_p(v['recall'])}")
+        lines += ["  by boundary position (test): " + _positions(m["d4b_by_position"]),
+                  "  " + _trend(m["d4b_by_position"])]
+    pooled = (m.get("d4a_test") or {}).get("pooled")
+    gate = None if not pooled or _bad(pooled["within_auroc"]) else bool(
+        pooled["within_auroc"] >= 0.75 and pooled["within_ci"][0] > 0.65)
+    lines += [
+        "GATE (test within-problem AUROC >= 0.75 with 95% CI lower bound > 0.65; D4a pooled): "
+        + ("n/a" if gate is None else "pass" if gate else "fail"),
+        f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} "
+        f"<= ${cfg['phase_budget_usd'][env['phase']]}",
+        "BLOCKERS: " + ("; ".join(f"{s} {v}" for s, v in skipped.items()) if skipped else "none"),
+    ]
+    m["smoke5_gate"] = gate
+    _write(run_dir, lines, m)
+
+
 def smoke(run_dir, m, cfg):
     env, _, lines = header(run_dir, m, cfg)
     price = m["price_per_hr"]
