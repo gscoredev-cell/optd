@@ -98,23 +98,20 @@ def _eval_fpr(ctx, model_probe, traces, flag_fn):
     return out
 
 
-def mca(c3, d):
-    ok, deadline = c3.budget("MCa")
-    if not ok:
-        return {"MCa_skipped": SKIP}
-    ctx = c3.s
+def mc_success(ctx, traces, run_id, tag, deadline, k=MC_K):
+    """MC success at the prompt and at every boundary of each trace: share of k sampled completions (T 0.8, total cap
+    MAX_NEW) correct under the primary rule. Whole groups of MC_GROUP traces only; no new group after the deadline.
+    Returns ({pid: [mc at prompt, boundary 1, ...]}, completions, generated tokens)."""
     model = ctx.student()
-    greedy = c3.src_load("S2", "greedy")
-    greedy = random.Random(0).sample(greedy, len(greedy))   # a time cut then keeps a mix of main and p1, not main only
-    done, n_rows, n_tok, t0 = {}, 0, 0, time.time()
-    for g0 in range(0, len(greedy), MC_GROUP):
-        group = greedy[g0:g0 + MC_GROUP]
-        rows = [(t, j, cut, k) for t in group for j, cut in enumerate([0] + [b + 1 for b in t["bounds"]])
-                for k in range(MC_K)]
+    done, n_rows, n_tok = {}, 0, 0
+    for g0 in range(0, len(traces), MC_GROUP):
+        group = traces[g0:g0 + MC_GROUP]
+        rows = [(t, j, cut, r) for t in group for j, cut in enumerate([0] + [b + 1 for b in t["bounds"]])
+                for r in range(k)]
         rows.sort(key=lambda r: len(r[0]["gen"]) - r[2], reverse=True)   # similar remaining lengths per batch
         toks, trunc = decode_batches(model, [t["prompt"] + t["gen"][:cut] for t, _, cut, _ in rows], ctx.gen_bs,
                                      MAX_NEW, ctx.eos, ctx.pad, budgets=[MAX_NEW - cut for _, _, cut, _ in rows],
-                                     seed_fn=lambda c, g0=g0: seed_for(c3.run_id, "mc", f"{g0}:{c}"),
+                                     seed_fn=lambda c, g0=g0: seed_for(run_id, tag, f"{g0}:{c}"),
                                      deadline=deadline, sample=True)
         if len(toks) < len(rows):
             break                                                              # out of time: keep whole traces only
@@ -124,9 +121,21 @@ def mca(c3, d):
             text = ctx.tok.decode(t["gen"][:cut] + tk, skip_special_tokens=True)
             succ.setdefault((t["pid"], j), []).append(primary_ok(text, ctx.gold[t["pid"]], tr))
         for t in group:
-            mc = [sum(succ[(t["pid"], j)]) / MC_K for j in range(len(t["bounds"]) + 1)]
-            done[t["pid"]] = {"mc": mc, "step_y": [int(mc[j] <= 1 / 3 and mc[j - 1] >= 2 / 3)
-                                                    for j in range(1, len(mc))]}
+            done[t["pid"]] = [sum(succ[(t["pid"], j)]) / k for j in range(len(t["bounds"]) + 1)]
+    return done, n_rows, n_tok
+
+
+def mca(c3, d):
+    ok, deadline = c3.budget("MCa")
+    if not ok:
+        return {"MCa_skipped": SKIP}
+    ctx = c3.s
+    greedy = c3.src_load("S2", "greedy")
+    greedy = random.Random(0).sample(greedy, len(greedy))   # a time cut then keeps a mix of main and p1, not main only
+    t0 = time.time()
+    raw, n_rows, n_tok = mc_success(ctx, greedy, c3.run_id, "mc", deadline)
+    done = {p: {"mc": mc, "step_y": [int(mc[j] <= 1 / 3 and mc[j - 1] >= 2 / 3) for j in range(1, len(mc))]}
+            for p, mc in raw.items()}
     ctx.save(d, "mc", done)
     by = {t["pid"]: t for t in greedy}
     wrong = [p for p in done if not by[p]["ok"]]

@@ -1,4 +1,5 @@
-"""One long-lived process per phase (OPTION_D_SPEC.md §13): ENVCHECK, SMOKE (and WATCHDOGTEST for the deadline test).
+"""One long-lived process per phase (OPTION_D_SPEC.md §13): ENVCHECK, SMOKE, SMOKE3/SMOKE4 diagnostics (and
+WATCHDOGTEST for the deadline test).
 
 Each stage writes runs/<RUN_ID>/stage_<name>/ and is skipped on restart once its .done marker exists.
 Never prints or stores question text, secrets or environment dumps.
@@ -169,18 +170,20 @@ def main():
                 run_stage(run_dir, name, lambda d, fn=fn: fn(ctx, d), m)
             write_status(run_dir, "report")
             report.smoke(run_dir, m, cfg)
-        elif a.phase == "SMOKE3":
-            import smoke3
-            c3 = smoke3.Ctx3(cfg, tiers, a.tier, a.run_id, run_dir)
-            for name, fn in smoke3.STAGES:   # diagnostic parts are independent: a failing one must not cost the report
+        elif a.phase in ("SMOKE3", "SMOKE4"):
+            import importlib
+            import smoke
+            mod = importlib.import_module(a.phase.lower())
+            c3 = (mod.Ctx3 if a.phase == "SMOKE3" else mod.Ctx4)(cfg, tiers, a.tier, a.run_id, run_dir)
+            for name, fn in mod.STAGES:   # diagnostic parts are independent: a failing one must not cost the report
                 try:
                     run_stage(run_dir, name, lambda d, fn=fn: fn(c3, d), m)
                 except Exception as e:
                     m[f"{name}_skipped"] = f"error: {type(e).__name__}: {(str(e).splitlines() or [''])[0][:200]}"
                     print(f"== stage {name} failed: {m[f'{name}_skipped']}")
-                    smoke3.smoke.free()
+                    smoke.free()
             write_status(run_dir, "report")
-            report.smoke3(run_dir, m, cfg)
+            getattr(report, a.phase.lower())(run_dir, m, cfg)
         else:
             raise NotImplementedError(f"phase {a.phase} is not implemented (FULL needs human approval of SMOKE)")
     except BaseException as e:

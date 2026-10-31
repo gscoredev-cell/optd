@@ -1,0 +1,179 @@
+{
+ "pipeline_start": 1793414036.8024604,
+ "torch": "2.8.0.dev20250319+cu128",
+ "cuda": "12.8",
+ "transformers": "4.57.1",
+ "peft": "0.17.1",
+ "device": "NVIDIA L40",
+ "capability": [
+  8,
+  9
+ ],
+ "bf16_matmul_rel_err": 0.00166,
+ "vram_gb": 44.4,
+ "env_min": 0.7,
+ "template_identical_ids": 20,
+ "template_empty_think": 20,
+ "template_n": 20,
+ "templates_min": 0.02,
+ "mc_traces": 144,
+ "mc_of": 300,
+ "mc_completions": 4167,
+ "mc_tok_per_s": 487.8909602619256,
+ "mc_step_pos": 44,
+ "mc_traces_with_bad_step": 27,
+ "mc_wrong_traces": 49,
+ "mc_wrong_with_bad_step": 11,
+ "mc_prompt_success_correct": 0.8701754385964913,
+ "mc_prompt_success_wrong": 0.14965986394557823,
+ "MCa_min": 18.28,
+ "step_pos_train": 42,
+ "step_pos_heldout": 2,
+ "step_boundaries_train": 1080,
+ "step_boundaries_heldout": 165,
+ "step_layers": "21",
+ "step_C": 0.0001,
+ "step_cv_auroc": 0.6073355379113852,
+ "step_auroc": 0.43558282208588955,
+ "step_tau": 0.04625867161706203,
+ "step_first_bad_within1": 0.0,
+ "step_heldout_traces_with_bad": 1,
+ "step_trace_auroc": 0.6973684210526315,
+ "step_table": {
+  "21|C=0.0001": {
+   "cv_auroc": 0.6073355379113852,
+   "heldout_auroc": 0.43558282208588955
+  },
+  "21|C=0.001": {
+   "cv_auroc": 0.5662775100548089
+  },
+  "21|C=0.01": {
+   "cv_auroc": 0.5112423586251824
+  },
+  "21|C=0.1": {
+   "cv_auroc": 0.49959075368892963
+  },
+  "21|C=1": {
+   "cv_auroc": 0.5025850138854315
+  }
+ },
+ "MCprobe_min": 6.01,
+ "b1_tok_per_s": 291.5171808121574,
+ "b1_n": 380,
+ "b1_template_identical": 20,
+ "b1_student_p2_primary": 0.75,
+ "b1_student_p2_strict": 0.75,
+ "b1_teacher_p2_primary": 0.82,
+ "b1_student_p2_trunc": 0.0,
+ "b1_student_main_primary": 0.85,
+ "b1_student_main_strict": 0.85,
+ "b1_teacher_main_primary": 0.975,
+ "b1_student_main_trunc": 0.025,
+ "b1_student_p1_primary": 0.9,
+ "b1_student_p1_strict": 0.9,
+ "b1_teacher_p1_primary": 0.875,
+ "b1_student_p1_trunc": 0.0,
+ "b1_student_rc_primary": 0.18,
+ "b1_student_rc_strict": 0.19,
+ "b1_teacher_rc_primary": 0.21,
+ "b1_student_rc_trunc": 0.21,
+ "b1_gap_p2": 0.07,
+ "b1_gap_p2_se": 0.03437160216189928,
+ "B1_min": 9.41,
+ "b2_n_problems": 256,
+ "b2_of": 600,
+ "b2_tok_per_s": 229.796401599995,
+ "b2_sec": 735.8600866794586,
+ "b2_greedy_primary_main": 0.9523809523809523,
+ "b2_greedy_primary_p1": 0.8,
+ "b2_greedy_primary_p2": 0.5,
+ "b2_greedy_primary_rc": 0.5952380952380952,
+ "b2_greedy_primary": 0.66796875,
+ "b2_sampled_primary": 0.6953125,
+ "b2_trunc": 0.015625,
+ "b2_mean_tokens": 330.26953125,
+ "B2_min": 12.27,
+ "b3_probe_layers": "27",
+ "b3_probe_C": 0.01,
+ "b3_probe_cv_auroc": 0.7057316666677682,
+ "b3_probe_auroc": 0.8100621820237422,
+ "b3_probe_tau": 0.8803097016991962,
+ "b3_probe_fpr": 0.09836065573770492,
+ "b3_probe_recall": 0.3103448275862069,
+ "b3_probe_gate": false,
+ "b3_probe_restart_share": 0.0,
+ "b3_probe_first_flag_hist": {
+  "2": 2,
+  "4": 2,
+  "5": 2,
+  "6": 2,
+  "9": 2,
+  "10": 1,
+  "11": 2,
+  "12": 2
+ },
+ "b3_probe_table": {
+  "27|C=0.001": {
+   "cv_auroc": 0.6881094626280484
+  },
+  "27|C=0.01": {
+   "cv_auroc": 0.7057316666677682,
+   "heldout_auroc": 0.8100621820237422
+  }
+ },
+ "b3_probe_holdout_traces": 90,
+ "b3_probe_holdout_wrong": 29,
+ "b3_probe_train_traces": 422,
+ "b3_probe_tau_weighted": true,
+ "b3_probe_by_set": {
+  "main": {
+   "n": 14,
+   "wrong": 1,
+   "auroc": 0.38461538461538464,
+   "fpr": 0.0
+  },
+  "p1": {
+   "n": 10,
+   "wrong": 0,
+   "auroc": NaN,
+   "fpr": 0.2
+  },
+  "p2": {
+   "n": 8,
+   "wrong": 1,
+   "auroc": 0.8571428571428571,
+   "fpr": 0.0
+  },
+  "rc": {
+   "n": 58,
+   "wrong": 27,
+   "auroc": 0.7622461170848268,
+   "fpr": 0.12903225806451613
+  }
+ },
+ "B3_min": 11.13,
+ "c2_n_problems": 576,
+ "c2_of": 1200,
+ "c2_tok_per_s": 375.14737151343087,
+ "c2_sec": 791.4303085803986,
+ "c2_greedy_primary_main": 0.6739130434782609,
+ "c2_greedy_primary_p1": 0.48344370860927155,
+ "c2_greedy_primary_p2": 0.36428571428571427,
+ "c2_greedy_primary_rc": 0.30612244897959184,
+ "c2_greedy_primary": 0.4548611111111111,
+ "c2_sampled_primary": 0.4513888888888889,
+ "c2_trunc": 0.0078125,
+ "c2_mean_tokens": 257.7282986111111,
+ "C2_min": 13.19,
+ "C3_skipped": "skipped: not enough pod time left",
+ "C3_min": 0.0,
+ "elapsed_min": 71.56,
+ "cost_usd": 0.978,
+ "cache_hits": 3,
+ "downloads": 1,
+ "bootstrap_min": 0.51,
+ "image_pull_min": 0.05,
+ "image_pull_cost_usd": 0.001,
+ "ssh_public_port": "46177",
+ "price_per_hr": 0.82
+}

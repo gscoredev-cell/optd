@@ -234,6 +234,86 @@ def smoke3(run_dir, m, cfg):
     _write(run_dir, lines, m)
 
 
+def _ci(c):
+    return f"[{_n(c[0])}, {_n(c[1])}]" if c else "[nan, nan]"
+
+
+def smoke4(run_dir, m, cfg):
+    env, _, lines = header(run_dir, m, cfg)
+    price = m["price_per_hr"]
+    stages = ("A1", "A2", "A4", "A3")
+    skipped = {s: m.get(f"{s}_skipped") for s in stages if m.get(f"{s}_skipped")}
+    lines += [
+        f"BRANCH: {cfg['smoke4_branch']} (Qwen3-1.7B) chosen by STAGE 0 (local, SMOKE-2 features): {cfg['smoke4_stage0']}",
+        "TIMING (min): " + " | ".join(f"{s} {m.get(f'{s}_min')}" for s in stages) + f" | total {m['elapsed_min']:.2f}",
+        "A1 MC STRATIFICATION (4 samples, T 0.8, cap 800; contested = 1..3 of 4 correct, the widest bounds that give "
+        "a correct and a wrong trace):",
+    ]
+    if "A1_skipped" in m:
+        lines.append(f"  {m['A1_skipped']}")
+    else:
+        lines.append(f"  problems {m['a1_problems']}/{m['a1_of']} | tok/s {_n(m['a1_tok_per_s'], 1)} (batch "
+                     f"{m['a1_bs']}) | truncation {_p(m['a1_trunc'])} | mean tokens {_n(m['a1_mean_tokens'], 1)}")
+        for k, v in m["a1_dist"].items():
+            lines.append(f"  {k}: problems {v['problems']} | #correct of 4 (0..4) {v['hist']} | accuracy "
+                         f"{_p(v['acc'])} | contested {_p(v['contested'])}")
+        p1 = m["a1_dist"].get("train_p1", {}).get("contested")
+        if p1 is not None and p1 < 0.30:
+            lines.append(f"  NOTE: contested share of train p1 {_p(p1)} < 30%; 1..3 of 4 is already the widest bound")
+    lines.append("A2 WITHIN-PROBLEM PROBE (one wrong + one correct per contested train problem; fp32 features; "
+                 "layer, C, pooling by grouped 5-fold CV on train ids):")
+    if "A2_skipped" in m or m.get("within_layers") is None:
+        lines.append(f"  {m.get('A2_skipped') or m.get('within_blocker', 'not run')} (pairs train "
+                     f"{m.get('within_train_pairs')}, held-out {m.get('within_heldout_pairs')})")
+    else:
+        lines += [
+            f"  pairs train {m['within_train_pairs']} | held-out {m['within_heldout_pairs']} | chosen: layer "
+            f"{m['within_layers']}, C {m['within_C']}, pooling {m['within_pool']} (cv {_n(m['within_cv_auroc'])})",
+            f"  held-out WITHIN-PROBLEM AUROC {_n(m['within_auroc'])} {_ci(m['within_ci'])} | pooled trace AUROC "
+            f"{_n(m['within_trace_auroc'])} | tau {_n(m['within_tau'], 4)} (FPR 10% on held-out contested correct): "
+            f"FPR {_p(m['within_heldout_fpr'])}, recall {_p(m['within_heldout_recall'])}",
+            "    by pooling (chosen layer): " + " ; ".join(f"{k} {_n(v['auroc'])} {_ci(v['ci'])}"
+                                                       for k, v in m["within_by_pool"].items()),
+            "    by layer (each at its best C; max / mean / last): " + " ; ".join(
+                f"{k} (C {v['C']}) {_n(v['max'])} / {_n(v['mean'])} / {_n(v['last'])}"
+                for k, v in m["within_by_layers"].items()),
+            "    by boundary position (chosen layer): " + " ; ".join(
+                f"{k}: {_n(v['auroc'])} (n {v['n']})" for k, v in m["within_by_position"].items()),
+            "    CV table (max / mean / last): " + " ; ".join(
+                f"{k} {_n(v['cv']['max'])}/{_n(v['cv']['mean'])}/{_n(v['cv']['last'])}"
+                for k, v in m["within_table"].items()),
+        ]
+    lines.append("A4 TEST (all traces of contested TEST problems; tau from A2):")
+    if "A4_skipped" in m:
+        lines.append(f"  {m['A4_skipped']}")
+    else:
+        for k, v in m["a4_test"].items():
+            lines.append(f"  {k}: problems {v['problems']} (correct {v['correct']}, wrong {v['wrong']}) | FPR "
+                         f"{_p(v['fpr'])} | recall {_p(v['recall'])} | within-pair AUROC {_n(v['within_auroc'])} "
+                         f"{_ci(v['within_ci'])} (pairs {v['pairs']})")
+    lines.append(f"A3 STEP LOCALIZATION (contested wrong train traces, 3 completions per point; first point with MC "
+                 f"success < 0.25; restart = first drop at the prompt or boundary 1):")
+    if "A3_skipped" in m:
+        lines.append(f"  {m['A3_skipped']}")
+    else:
+        lines.append(f"  traces {m['a3_traces']}/{m['a3_of']} | completions {m['a3_completions']} | tok/s "
+                     f"{_n(m['a3_tok_per_s'], 1)} | MC at prompt mean {_n(m['a3_mc_prompt_mean'])} | restart share "
+                     f"{_p(m['a3_restart_share'])} | never below 0.25 {_p(m['a3_never_share'])} | first drop "
+                     f"(0 = prompt) {m['a3_first_drop_hist']}")
+    pooled = (m.get("a4_test") or {}).get("pooled", {})
+    gate = None if m.get("within_auroc") is None or not pooled else bool(
+        m["within_auroc"] >= 0.80 and pooled.get("recall", 0) >= 0.40)
+    lines += [
+        "GATE (within-problem AUROC >= 0.80 held-out and recall >= 0.40 at FPR 10% on test): "
+        + ("n/a" if gate is None else "pass" if gate else "fail"),
+        f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} "
+        f"<= ${cfg['phase_budget_usd'][env['phase']]}",
+        "BLOCKERS: " + ("; ".join(f"{s} {v}" for s, v in skipped.items()) if skipped else "none"),
+    ]
+    m["smoke4_gate"] = gate
+    _write(run_dir, lines, m)
+
+
 def smoke(run_dir, m, cfg):
     env, _, lines = header(run_dir, m, cfg)
     price = m["price_per_hr"]

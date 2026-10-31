@@ -174,6 +174,115 @@ def fit_step(feats, step_y, wrong, oids, layers, layer_sets=None, c_grid=C_GRID,
         "step_heldout_traces_with_bad": len(bad), "step_trace_auroc": trace_auc, "step_table": table}}
 
 
+POOLS = {"max": np.max, "mean": np.mean, "last": lambda v: v[-1]}
+
+
+def pair_auroc(sw, sc):
+    """Within-pair AUROC: share of pairs whose wrong trace scores above its correct twin (ties count 0.5)."""
+    sw, sc = np.asarray(sw, dtype=float), np.asarray(sc, dtype=float)
+    return float(np.mean(np.where(sw > sc, 1.0, np.where(sw == sc, 0.5, 0.0)))) if len(sw) else float("nan")
+
+
+def pair_ci(sw, sc, n=2000, seed=0):
+    """95% bootstrap CI of pair_auroc, resampling pairs."""
+    sw, sc = np.asarray(sw, dtype=float), np.asarray(sc, dtype=float)
+    if not len(sw):
+        return [float("nan")] * 2
+    rng = np.random.default_rng(seed)
+    bs = [pair_auroc(sw[b], sc[b]) for b in (rng.integers(0, len(sw), len(sw)) for _ in range(n))]
+    return [float(x) for x in np.percentile(bs, [2.5, 97.5])]
+
+
+def pairs(idx, wrong, problem):
+    """[(wrong trace, correct trace)] per problem that has both among idx (first of each, in idx order)."""
+    w, c = {}, {}
+    for i in idx:
+        (w if wrong[i] else c).setdefault(problem[i], i)
+    return [(w[k], c[k]) for k in w if k in c]
+
+
+def score(pr, f):
+    """Pooled trace score of one trace under a fit_within probe."""
+    return float(POOLS[pr["pool"]](_score(pr["model"], f, pr["cols"])))
+
+
+def fit_within(feats, wrong, problem, groups, layers, layer_sets=None, c_grid=C_GRID, holdout=None, deadline=None,
+               fpr=0.10):
+    """Within-problem probe: traces come in (wrong, correct) pairs of the same problem. Boundary labels = trace wrong;
+    layer set, C and pooling (max/mean/last) chosen by grouped 5-fold CV on the train groups maximizing within-pair
+    AUROC; held-out groups report within-pair AUROC (+ bootstrap CI) by pooling and boundary position, pooled trace
+    AUROC, and tau at FPR <= fpr on held-out correct traces."""
+    import time
+    late = lambda: deadline is not None and time.time() > deadline
+    layer_sets = layer_sets or _default_sets(layers)
+    hold = holdout if holdout is not None else holdout_by_oid(groups)
+    tr = [i for i, g in enumerate(groups) if g not in hold and len(feats[i])]
+    te = [i for i, g in enumerate(groups) if g in hold and len(feats[i])]
+    p_tr, p_te = pairs(tr, wrong, problem), pairs(te, wrong, problem)
+    counts = {"within_train_pairs": len(p_tr), "within_heldout_pairs": len(p_te)}
+    if len(p_tr) < 5 or not p_te:
+        return {"name": None, "metrics": {**counts, "within_blocker": "too few contested pairs"}}
+    labels = {i: np.full(len(feats[i]), int(wrong[i])) for i in tr + te}
+    folds = group_kfold([groups[i] for i in tr], k=5)
+    table, best, set_best = {}, None, {}
+    for name, ls in layer_sets.items():
+        if best is not None and late():
+            break
+        cols = [layers.index(l) for l in ls]
+        for C in c_grid:
+            if f"{name}|C={c_grid[0]:g}" in table and late():
+                break
+            cv = {p: [] for p in POOLS}
+            for ftr, fva in folds:
+                a_idx, v_idx = [tr[j] for j in ftr], [tr[j] for j in fva]
+                pv = pairs(v_idx, wrong, problem)
+                if not pv or len({wrong[i] for i in a_idx}) < 2:
+                    continue
+                mdl = _fit(feats, labels, a_idx, cols, C)
+                s = {i: _score(mdl, feats[i], cols) for p in pv for i in p}
+                for pn, pool in POOLS.items():
+                    cv[pn].append(pair_auroc([pool(s[a]) for a, _ in pv], [pool(s[b]) for _, b in pv]))
+            row = {pn: float(np.mean(v)) if v else float("nan") for pn, v in cv.items()}
+            table[f"{name}|C={C:g}"] = {"cv": row}
+            top = max(row, key=lambda pn: np.nan_to_num(row[pn], nan=-1))
+            if name not in set_best or np.nan_to_num(row[top], nan=-1) > set_best[name][0]:
+                set_best[name] = (np.nan_to_num(row[top], nan=-1), C, cols)
+            if best is None or np.nan_to_num(row[top], nan=-1) > np.nan_to_num(best[0], nan=-1):
+                best = (row[top], name, cols, C, top)
+    cv_best, name, cols, C, pool = best
+    held_sets = {}
+    for nm, (_, c2, cols2) in set_best.items():   # held-out within-pair AUROC of every layer set at its best C
+        m2 = _fit(feats, labels, tr, cols2, c2)
+        r2 = {i: _score(m2, feats[i], cols2) for i in te}
+        held_sets[nm] = {"C": c2, **{pn: pair_auroc([pf(r2[a]) for a, _ in p_te], [pf(r2[b]) for _, b in p_te])
+                                     for pn, pf in POOLS.items()}}
+        if nm == name:
+            model, raw = m2, r2
+    pr = {"name": name, "cols": cols, "model": model, "pool": pool, "C": C}
+    held = {}
+    for pn, pf in POOLS.items():
+        sw, sc = [pf(raw[a]) for a, _ in p_te], [pf(raw[b]) for _, b in p_te]
+        held[pn] = {"auroc": pair_auroc(sw, sc), "ci": pair_ci(sw, sc)}
+    by_pos = {}
+    for k in range(1, 13):
+        pk = [(a, b) for a, b in p_te if len(raw[a]) >= k and len(raw[b]) >= k]
+        if pk:
+            by_pos[k] = {"n": len(pk), "auroc": pair_auroc([raw[a][k - 1] for a, _ in pk], [raw[b][k - 1] for _, b in pk])}
+    s = {i: float(POOLS[pool](raw[i])) for i in te}
+    neg = [s[i] for i in te if not wrong[i]]
+    tau = tau_at_fpr(neg, fpr)
+    pos = [s[i] for i in te if wrong[i]]
+    pr["tau"] = tau
+    pr["metrics"] = {
+        **counts, "within_layers": name, "within_C": C, "within_pool": pool, "within_cv_auroc": cv_best,
+        "within_auroc": held[pool]["auroc"], "within_ci": held[pool]["ci"], "within_by_pool": held,
+        "within_by_position": by_pos, "within_table": table, "within_by_layers": held_sets,
+        "within_trace_auroc": auroc(pos, neg), "within_tau": tau,
+        "within_heldout_fpr": float(np.mean(np.array(neg) >= tau)),
+        "within_heldout_recall": float(np.mean(np.array(pos) >= tau))}
+    return pr
+
+
 def flag(probe, feats):
     """First flagged boundary (1-based) for one trace, or None."""
     if probe["name"] is None:

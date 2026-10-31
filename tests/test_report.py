@@ -77,6 +77,42 @@ def test_smoke3_report_full(tmp_path, monkeypatch):
     json.loads((run / "metrics.json").read_text())
 
 
+CFG4 = {**CFG, "phase_budget_usd": {"SMOKE3": 1.5}, "smoke4_branch": "A", "smoke4_stage0": "within-pair 0.75"}
+
+
+def test_smoke4_report_full(tmp_path, monkeypatch):
+    from test_probe import _pair_traces
+    run = _run_dir(tmp_path, monkeypatch)
+    feats, wrong, problem, groups = _pair_traces(n_problems=60)
+    pm = probe.fit_within(feats, wrong, problem, groups, [14, 21], layer_sets={"14": [14], "21": [21]},
+                          c_grid=(1e-2,))["metrics"]
+    dist = {"train_p1": {"problems": 200, "hist": [40, 30, 30, 30, 70], "acc": 0.55, "contested": 0.45},
+            "test_p2": {"problems": 200, "hist": [80, 20, 20, 20, 60], "acc": 0.4, "contested": 0.3}}
+    test = {s: {"problems": 50, "correct": 90, "wrong": 110, "fpr": 0.1, "recall": 0.45, "pairs": 50,
+                "within_auroc": 0.8, "within_ci": [0.7, 0.9]} for s in ("p1", "p2", "pooled")}
+    m = {**_base(), **{f"{s}_min": 1.0 for s in ("A1", "A2", "A4", "A3")}, **pm,
+         "a1_problems": 800, "a1_of": 800, "a1_tok_per_s": 700.0, "a1_bs": 128, "a1_trunc": 0.01,
+         "a1_mean_tokens": 280.0, "a1_dist": dist, "a4_test": test,
+         "a3_traces": 100, "a3_of": 100, "a3_completions": 3000, "a3_tok_per_s": 500.0, "a3_restart_share": 0.3,
+         "a3_never_share": 0.1, "a3_mc_prompt_mean": 0.5, "a3_first_drop_hist": {"0": 10, "3": 5, "never": 2}}
+    report.smoke4(run, m, CFG4)
+    text = (run / "report.md").read_text()
+    for needle in ("BRANCH: A", "A1 MC STRATIFICATION", "train_p1: problems 200", "WITHIN-PROBLEM AUROC",
+                   "by boundary position", "A4 TEST", "pooled: problems 50", "A3 STEP LOCALIZATION",
+                   "restart share 30.0%", "GATE", "BLOCKERS: none"):
+        assert needle in text, needle
+    assert json.loads((run / "metrics.json").read_text())["smoke4_gate"] in (True, False)
+
+
+def test_smoke4_report_all_skipped(tmp_path, monkeypatch):
+    run = _run_dir(tmp_path, monkeypatch)
+    m = {**_base(), **{f"{s}_skipped": "skipped: not enough pod time left" for s in ("A1", "A2", "A4", "A3")}}
+    report.smoke4(run, m, CFG4)
+    text = (run / "report.md").read_text()
+    assert "GATE (within-problem AUROC >= 0.80 held-out and recall >= 0.40 at FPR 10% on test): n/a" in text
+    assert "BLOCKERS: A1 skipped" in text
+
+
 def test_smoke3_report_all_skipped(tmp_path, monkeypatch):
     run = _run_dir(tmp_path, monkeypatch)
     m = {**_base(), **{f"{s}_skipped": "skipped: not enough pod time left"

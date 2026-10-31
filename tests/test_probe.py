@@ -86,6 +86,48 @@ def test_fit_step_finds_the_bad_boundary():
     assert m["step_first_bad_within1"] > 0.5 and m["step_pos_heldout"] > 0
 
 
+def _pair_traces(n_problems=200, signal=2.5, seed=2):
+    """One wrong + one correct trace per problem; a per-problem offset shared by both twins (difficulty) is pure
+    nuisance; the slip shows up only from a random boundary on, in layer index 1."""
+    rng = np.random.default_rng(seed)
+    feats, wrong, problem, groups = [], [], [], []
+    for p in range(n_problems):
+        base = rng.normal(scale=3.0, size=(1, 2, 8))
+        for w in (1, 0):
+            nb = int(rng.integers(4, 9))
+            f = (rng.normal(size=(nb, 2, 8)) + base).astype(np.float32)
+            if w:
+                f[int(rng.integers(0, nb)):, 1, 0] += signal
+            feats.append(f), wrong.append(w), problem.append(f"q{p}"), groups.append(p // 2)
+    return feats, wrong, problem, groups
+
+
+def test_pair_auroc_and_pairs():
+    assert probe.pair_auroc([2, 1, 1], [1, 1, 3]) == pytest.approx(0.5)
+    assert np.isnan(probe.pair_auroc([], []))
+    assert probe.pairs([0, 1, 2, 3, 4], [1, 0, 1, 1, 0], ["a", "a", "b", "c", "c"]) == [(0, 1), (3, 4)]
+    lo, hi = probe.pair_ci([1] * 30 + [0] * 10, [0] * 30 + [1] * 10)
+    assert lo < 0.75 < hi
+
+
+def test_fit_within_finds_the_slip_layer():
+    feats, wrong, problem, groups = _pair_traces()
+    pr = probe.fit_within(feats, wrong, problem, groups, layers=[14, 21], layer_sets={"14": [14], "21": [21]},
+                          c_grid=(1e-2, 1e-1))
+    m = pr["metrics"]
+    assert pr["name"] == "21" and m["within_auroc"] > 0.8 and m["within_ci"][0] < m["within_auroc"]
+    assert set(m["within_by_pool"]) == {"max", "mean", "last"} and set(m["within_by_layers"]) == {"14", "21"}
+    assert m["within_by_layers"]["14"]["max"] < 0.7 and m["within_heldout_fpr"] <= 0.10
+    assert m["within_heldout_pairs"] > 0 and 1 in m["within_by_position"]
+    assert 0 <= probe.score(pr, feats[0]) <= 1
+
+
+def test_fit_within_too_few_pairs():
+    feats, wrong, problem, groups = _pair_traces(n_problems=3)
+    pr = probe.fit_within(feats, wrong, problem, groups, layers=[14, 21])
+    assert pr["name"] is None and "within_blocker" in pr["metrics"]
+
+
 def test_fit_step_without_positives_reports_blocker():
     feats, _, oids = _traces(n=40)
     pr = probe.fit_step(feats, [np.zeros(len(f), int) for f in feats], [0] * 40, oids, layers=[21, 28])
