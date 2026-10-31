@@ -1,7 +1,8 @@
 """SMOKE stages S1-S8 (§10). Pipeline check only: sizes are fixed by the spec, accuracy numbers carry no weight.
 
-Artifacts per stage go to runs/<RUN_ID>/stage_<name>/ as token ids, pids, flags, probe and adapter (never question
-text). A restarted pod reloads them, so every stage can run after a restart once its inputs are on the volume.
+Scoring: "ok" is the primary rule (lenient answer, truncated = wrong); "ok_strict" is the secondary strict rule.
+Artifacts per stage go to runs/<RUN_ID>/stage_<name>/ as token ids, pids, flags, features, probe and adapter (never
+question text). A restarted pod reloads them, so every stage can run after a restart once its inputs are on the volume.
 """
 import gc
 import json
@@ -15,7 +16,8 @@ import torch
 import data as D
 import probe as P
 from continuations import continuations
-from core import arm_metrics, boundaries, extract_lenient, extract_strict, kill_plan, matches, rollback_cut, seed_for
+from core import (arm_metrics, boundaries, extract_strict, kill_plan, matches, primary_ok, rollback_cut,
+                  seed_for)
 from eval import plain, retry
 from generate import decode, decode_batches, eos_ids, load_model, load_tokenizer, prefill_states, prompt_ids
 from teacher_score import score
@@ -25,6 +27,8 @@ SETS = ("p2", "main", "p1", "rc")
 TEST_SIZES = {"p2": 200, "main": 40, "p1": 40, "rc": 100}
 TRAIN_N, IDENTITY_N, CONT_K, CONT_MAX = 300, 20, 4, 150
 TRUNC_LIMIT, MAX_NEW_RETRY = 0.10, 800
+RC_LEVELS, RC_N, RC_TEACHER_MIN, RC_TRUNC_MAX = (3, 4, 5), 60, 0.60, 0.05
+FEAT_BS = 8   # fixed fp32 prefill batch for boundary features
 
 
 def free():
@@ -45,11 +49,12 @@ class Ctx:
         test = [p for c in ("p2", "main", "p1") for p in D.sample(D.problems(gsm, [c], test_oids), TEST_SIZES[c])]
         self.test = sorted(test + D.random_calculation(TEST_SIZES["rc"], seed=0), key=lambda p: p["pid"])
         self.train = D.sample(D.problems(gsm, ["main", "p1"], train_oids), TRAIN_N)
+        self.rc_cal = {k: D.random_calculation(RC_N, seed=100 + k, min_ops=k, max_ops=k) for k in RC_LEVELS}
         assert not {p["oid"] for p in self.train} & {p["oid"] for p in self.test if p["oid"] is not None}
-        self.gold = {p["pid"]: p["gold"] for p in self.test + self.train}
+        self.gold = {p["pid"]: p["gold"] for p in self.test + self.train + sum(self.rc_cal.values(), [])}
         self.tok = load_tokenizer(cfg["student"])
         self.pad = self.tok.pad_token_id
-        self._student, self._lora = None, False
+        self._student, self._lora, self._fp32 = None, False, None
 
     # models
     def student(self):
@@ -74,22 +79,38 @@ class Ctx:
     def lora_init(self):
         return torch.load(self.run_dir / "stage_S4" / "lora_init.pt", weights_only=False)
 
+    def fp32(self):
+        """fp32 copy of the base student used only for boundary features (§9.1); freed after use."""
+        if self._fp32 is None:
+            self._fp32 = load_model(self.cfg["student"], dtype=torch.float32)
+        return self._fp32
+
+    def drop_fp32(self):
+        self._fp32 = None
+        free()
+
     # traces
     def max_new(self):
         return json.loads((self.run_dir / "stage_S1" / "metrics.json").read_text())["s1_max_new_final"]
+
+    def probe_gate(self):
+        return json.loads((self.run_dir / "stage_S3" / "metrics.json").read_text()).get("probe_gate", False)
 
     def trace(self, pid, prompt, gen, truncated):
         text = self.tok.decode(gen, skip_special_tokens=True)
         g = self.gold[pid]
         return {"pid": pid, "set": pid.split(":")[0], "prompt": prompt, "gen": gen, "truncated": truncated,
                 "bounds": boundaries([self.tok.decode([t]) for t in gen]),
-                "ok": matches(extract_strict(text), g), "ok_lenient": matches(extract_lenient(text), g)}
+                "ok": primary_ok(text, g, truncated), "ok_strict": matches(extract_strict(text), g)}
 
     def greedy(self, model, probs, max_new, adapter_on=False):
+        """Greedy traces plus generated tokens/s for this call."""
         prompts = [prompt_ids(self.tok, p["question"]) for p in probs]
+        t0 = time.time()
         toks, trunc = decode_batches(model, prompts, self.gen_bs, max_new, eos_ids(model), self.pad,
                                      adapter_on=adapter_on)
-        return [self.trace(p["pid"], pr, g, t) for p, pr, g, t in zip(probs, prompts, toks, trunc)]
+        rate = sum(map(len, toks)) / (time.time() - t0)
+        return [self.trace(p["pid"], pr, g, t) for p, pr, g, t in zip(probs, prompts, toks, trunc)], rate
 
     def save(self, d, name, obj):
         torch.save(obj, d / f"{name}.pt")
@@ -98,12 +119,15 @@ class Ctx:
         return torch.load(self.run_dir / f"stage_{stage}" / f"{name}.pt", weights_only=False)
 
     def layers(self):
+        """Probe layers 3L/4 and L (21 and 28 for Qwen3-1.7B)."""
         L = self.student().config.num_hidden_layers
-        return [L // 2, 3 * L // 4, L]
+        return [3 * L // 4, L]
 
-    def feats(self, model, traces):
-        return prefill_states(model, [t["prompt"] + t["gen"] for t in traces],
-                              [[len(t["prompt"]) + b for b in t["bounds"]] for t in traces], self.layers(), self.pre_bs)
+    def feats(self, traces, layers=None):
+        """Boundary states from an fp32 prefill with a fixed batch size."""
+        return prefill_states(self.fp32(), [t["prompt"] + t["gen"] for t in traces],
+                              [[len(t["prompt"]) + b for b in t["bounds"]] for t in traces],
+                              layers or self.layers(), FEAT_BS)
 
 
 def _rate(traces, key, s=None):
@@ -116,10 +140,10 @@ def s1(ctx, d):
     m, tried = {}, []
     for max_new in dict.fromkeys([ctx.cfg["max_new_tokens"], MAX_NEW_RETRY]):
         t0 = time.time()
-        stu = ctx.greedy(ctx.student(), ctx.test, max_new)
+        stu, m[f"s1_student_tok_per_s_{max_new}"] = ctx.greedy(ctx.student(), ctx.test, max_new)
         t1 = time.time()
         teacher = load_model(ctx.cfg["teacher"])
-        tea = ctx.greedy(teacher, ctx.test, max_new)
+        tea, m[f"s1_teacher_tok_per_s_{max_new}"] = ctx.greedy(teacher, ctx.test, max_new)
         del teacher
         free()
         m[f"s1_student_sec_{max_new}"], m[f"s1_teacher_sec_{max_new}"] = t1 - t0, time.time() - t1
@@ -132,8 +156,8 @@ def s1(ctx, d):
     m["s1_max_new_tried"], m["s1_max_new_final"] = tried, tried[-1]
     for who, tr in (("student", stu), ("teacher", tea)):
         for s in SETS:
-            m[f"s1_{who}_{s}_strict"] = _rate(tr, "ok", s)
-            m[f"s1_{who}_{s}_lenient"] = _rate(tr, "ok_lenient", s)
+            m[f"s1_{who}_{s}_primary"] = _rate(tr, "ok", s)
+            m[f"s1_{who}_{s}_strict"] = _rate(tr, "ok_strict", s)
     diff = [int(t["ok"]) - int(u["ok"]) for t, u in zip(tea, stu) if u["set"] == "p2"]
     m["s1_gap_p2"] = statistics.mean(diff)
     m["s1_gap_p2_se"] = statistics.stdev(diff) / math.sqrt(len(diff))
@@ -143,57 +167,100 @@ def s1(ctx, d):
     return m
 
 
+def s1rc(ctx, d):
+    """RandomCalculation calibration: 60 problems at 3, 4, 5 operations, student and teacher, primary accuracy and
+    truncation at 800 tokens; choose the largest level with teacher >= 60% and truncation <= 5% (both models)."""
+    m, ok_levels = {}, []
+    probs = [p for k in RC_LEVELS for p in ctx.rc_cal[k]]
+    stu, _ = ctx.greedy(ctx.student(), probs, MAX_NEW_RETRY)
+    teacher = load_model(ctx.cfg["teacher"])
+    tea, _ = ctx.greedy(teacher, probs, MAX_NEW_RETRY)
+    del teacher
+    free()
+    level = {p["pid"]: k for k in RC_LEVELS for p in ctx.rc_cal[k]}
+    for k in RC_LEVELS:
+        row = {}
+        for who, tr in (("student", stu), ("teacher", tea)):
+            sub = [t for t in tr if level[t["pid"]] == k]
+            row[f"{who}_acc"], row[f"{who}_trunc"] = _rate(sub, "ok"), _rate(sub, "truncated")
+        m[f"rc_cal_{k}"] = row
+        if row["teacher_acc"] >= RC_TEACHER_MIN and max(row["student_trunc"], row["teacher_trunc"]) <= RC_TRUNC_MAX:
+            ok_levels.append(k)
+    m["rc_ops_choice"] = max(ok_levels) if ok_levels else None
+    return m
+
+
 def s2(ctx, d):
     """Student rollouts on train prompts: greedy + 1 sample."""
     model, max_new = ctx.student(), ctx.max_new()
     t0 = time.time()
-    greedy = ctx.greedy(model, ctx.train, max_new)
+    greedy, greedy_rate = ctx.greedy(model, ctx.train, max_new)
     prompts = [t["prompt"] for t in greedy]
+    t1 = time.time()
     toks, trunc = decode_batches(model, prompts, ctx.gen_bs, max_new, ctx.eos, ctx.pad, sample=True,
                                  seed_fn=lambda c: seed_for(ctx.run_id, "s2", greedy[c * ctx.gen_bs]["pid"]))
+    sample_rate = sum(map(len, toks)) / (time.time() - t1)
     sampled = [ctx.trace(t["pid"], t["prompt"], g, tr) for t, g, tr in zip(greedy, toks, trunc)]
     ctx.save(d, "greedy", greedy)
     ctx.save(d, "sampled", sampled)
     both = greedy + sampled
-    return {"s2_n": len(both), "s2_greedy_strict": _rate(greedy, "ok"), "s2_sampled_strict": _rate(sampled, "ok"),
+    return {"s2_n": len(both), "s2_greedy_primary": _rate(greedy, "ok"), "s2_sampled_primary": _rate(sampled, "ok"),
+            "s2_greedy_strict": _rate(greedy, "ok_strict"),
             "s2_mean_tokens": statistics.mean(len(t["gen"]) for t in both),
             "s2_mean_boundaries": statistics.mean(len(t["bounds"]) for t in both),
-            "s2_trunc": _rate(both, "truncated"), "s2_sec": time.time() - t0}
+            "s2_trunc": _rate(both, "truncated"), "s2_sec": time.time() - t0,
+            "s2_greedy_tok_per_s": greedy_rate, "s2_sample_tok_per_s": sample_rate}
 
 
-def _state_tolerance(ctx, model, traces):
-    """Max relative L2 gap between generation-time and prefill hidden states at boundaries (same tokens)."""
-    layers = ctx.layers()
-    toks, _, states = decode(model, [t["prompt"] for t in traces], ctx.max_new(), ctx.eos, ctx.pad, capture=layers)
-    seqs, pos, kept = [], [], []
-    for t, g in zip(traces, toks):
+def _rel(a, b):
+    return float((a - b).norm() / b.norm())
+
+
+def _tolerance(ctx, traces):
+    """Per-layer max relative L2 between generation-time states (batch 1, bf16) and (a) a batch-1 unpadded bf16
+    prefill, (b) the fp32 fixed-batch prefill the probe uses, at the boundaries of the regenerated tokens."""
+    model = ctx.student()
+    layers = list(range(1, model.config.num_hidden_layers + 1))
+    worst_b1 = {l: 0.0 for l in layers}
+    worst_fp32 = {l: 0.0 for l in layers}
+    regen = []
+    for t in traces:
+        (g,), _, states = decode(model, [t["prompt"]], ctx.max_new(), ctx.eos, ctx.pad, capture=layers)
         b = [x for x in boundaries([ctx.tok.decode([y]) for y in g]) if x + 1 < len(states)]
-        seqs.append(t["prompt"] + g)
-        pos.append([len(t["prompt"]) + x for x in b])
-        kept.append(b)
-    pre = prefill_states(model, seqs, pos, layers, ctx.pre_bs)
-    worst = 0.0
-    for r, b in enumerate(kept):
-        for j, x in enumerate(b):
-            for li in range(len(layers)):
-                g, p = states[x + 1][li][r], pre[r][j, li]
-                worst = max(worst, float((g - p).norm() / p.norm()))
-    return worst
+        regen.append({"prompt": t["prompt"], "gen": g, "bounds": b, "states": states})
+    b1 = prefill_states(model, [r["prompt"] + r["gen"] for r in regen],
+                        [[len(r["prompt"]) + x for x in r["bounds"]] for r in regen], layers, 1)
+    f32 = ctx.feats(regen, layers)
+    for r, p1, p32 in zip(regen, b1, f32):
+        for j, x in enumerate(r["bounds"]):
+            for li, l in enumerate(layers):
+                g = r["states"][x + 1][li][0]
+                worst_b1[l] = max(worst_b1[l], _rel(g, p1[j, li]))
+                worst_fp32[l] = max(worst_fp32[l], _rel(g, p32[j, li]))
+    return {"tol_gen_vs_b1_bf16": worst_b1, "tol_gen_vs_fp32_batched": worst_fp32,
+            "tol_max_b1": max(worst_b1.values()), "tol_max_fp32": max(worst_fp32.values()),
+            "tol_boundaries": sum(len(r["bounds"]) for r in regen)}
 
 
 def s3(ctx, d):
-    """Probe fit/select/tau on S2 traces (labels: strict answer wrong), restart share, state tolerance."""
-    model = ctx.student()
+    """Probe on S2 traces (labels: primary rule wrong): fp32 features, grouped-CV C, layer sets 21/28/21+28."""
     greedy, sampled = ctx.load("S2", "greedy"), ctx.load("S2", "sampled")
     traces = greedy + sampled
     oid = {p["pid"]: p["oid"] for p in ctx.train}
-    feats = ctx.feats(model, traces)
+    t0 = time.time()
+    feats = ctx.feats(traces)
+    feat_sec = time.time() - t0
+    ctx.save(d, "feats", {"pids": [t["pid"] for t in traces], "wrong": [not t["ok"] for t in traces],
+                          "oids": [oid[t["pid"]] for t in traces], "layers": ctx.layers(),
+                          "feats": [f.half() for f in feats]})
+    t1 = time.time()
     pr = P.fit(feats, [not t["ok"] for t in traces], [oid[t["pid"]] for t in traces], ctx.layers())
+    m = {**pr["metrics"], "s3_feat_sec": feat_sec, "s3_fit_sec": time.time() - t1}
     flags = {t["pid"]: P.flag(pr, f) for t, f in zip(greedy, feats[:len(greedy)])}
     ctx.save(d, "probe", pr)
     ctx.save(d, "flags", flags)
-    m = dict(pr["metrics"])
-    m["s3_state_tol"] = _state_tolerance(ctx, model, greedy[:5])
+    m.update(_tolerance(ctx, greedy[:5]))
+    ctx.drop_fp32()
     m["s3_flagged_greedy"] = sum(1 for v in flags.values() if v)
     m["s3_flagged_wrong_greedy"] = sum(1 for t in greedy if flags[t["pid"]] and not t["ok"])
     return m
@@ -212,12 +279,17 @@ def s4(ctx, d):
     a2 = retry(model, a0, flags, adapter_on=False, **kw)
     a3 = retry(model, a0, flags, adapter_on=True, **kw)
     diffs = [sum(x != y for x, y in zip(a2[p][0], a3[p][0])) + abs(len(a2[p][0]) - len(a3[p][0])) for p in a2]
-    return {"identity_n": len(a2), "identity_equal": all(x == 0 for x in diffs),
+    return {"identity_n": len(a2), "identity_equal": bool(a2) and all(x == 0 for x in diffs),
             "identity_max_token_diff": max(diffs, default=0)}
+
+
+SKIPPED = {"skipped": "probe gate failed (S5-S7 skipped; S8 A3/A6 use the untrained adapter)"}
 
 
 def s5(ctx, d):
     """Continuations x4 from flagged prefixes of wrong greedy train traces (<= 150 traces)."""
+    if not ctx.probe_gate():
+        return dict(SKIPPED)
     model, max_new = ctx.lora(), ctx.max_new()
     flags, greedy = ctx.load("S3", "flags"), ctx.load("S2", "greedy")
     wrong = [t for t in greedy if flags.get(t["pid"]) and not t["ok"]]
@@ -231,11 +303,13 @@ def s5(ctx, d):
         c["ok"] = ctx.trace(c["pid"], [], kept[c["pid"]] + c["cont"], c["truncated"])["ok"]
     ctx.save(d, "conts", conts)
     return {"s5_flagged_wrong": len(wrong), "s5_problems": len(items), "s5_continuations": len(conts),
-            "s5_strict": _rate(conts, "ok"), "s5_trunc": _rate(conts, "truncated")}
+            "s5_primary": _rate(conts, "ok"), "s5_trunc": _rate(conts, "truncated")}
 
 
 def s6(ctx, d):
     """Teacher (and sampling-time student) log-probs per continuation token; teacher-also-wrong on those problems."""
+    if not ctx.probe_gate():
+        return dict(SKIPPED)
     conts = ctx.load("S5", "conts")
     lp_s = score(ctx.lora(), conts, ctx.pre_bs, adapter_on=False)   # untrained adapter == base model
     teacher = load_model(ctx.cfg["teacher"])
@@ -244,7 +318,7 @@ def s6(ctx, d):
     prefill_sec, prefill_tokens = time.time() - t0, sum(len(c["prefix"]) + len(c["cont"]) for c in conts)
     pids = sorted({c["pid"] for c in conts})
     by = {p["pid"]: p for p in ctx.train}
-    tea = ctx.greedy(teacher, [by[p] for p in pids], ctx.max_new()) if pids else []
+    tea = ctx.greedy(teacher, [by[p] for p in pids], ctx.max_new())[0] if pids else []
     del teacher
     free()
     ctx.save(d, "logprobs", {"lp_s": lp_s, "lp_t": lp_t})
@@ -257,6 +331,9 @@ def s6(ctx, d):
 def s7(ctx, d):
     """Train one rkl round; kill at kill_at and resume from the last checkpoint (spec 15 / every 10)."""
     model = ctx.lora()
+    if not ctx.probe_gate():
+        torch.save(ctx.lora_init(), d / "adapter.pt")
+        return dict(SKIPPED)
     conts, lp = ctx.load("S5", "conts"), ctx.load("S6", "logprobs")
     data = [{"prefix": c["prefix"], "cont": c["cont"], "lp_t": lp["lp_t"][i], "lp_s": lp["lp_s"][i]}
             for i, c in enumerate(conts) if c["cont"]]
@@ -293,33 +370,37 @@ def s8(ctx, d):
     set_lora(model, torch.load(ctx.run_dir / "stage_S7" / "adapter.pt", weights_only=False))
     a0, pr = ctx.load("S1", "a0"), ctx.load("S3", "probe")
     t0 = time.time()
-    flags = {t["pid"]: P.flag(pr, f) for t, f in zip(a0, ctx.feats(model, a0))}
+    flags = {t["pid"]: P.flag(pr, f) for t, f in zip(a0, ctx.feats(a0))}
+    ctx.drop_fp32()
     kw = dict(bs=ctx.gen_bs, max_new=max_new, eos=ctx.eos, pad=ctx.pad)
     a2 = retry(model, a0, flags, run_id=ctx.run_id, adapter_on=False, **kw)
     a3 = retry(model, a0, flags, run_id=ctx.run_id, adapter_on=True, **kw)
+    t1 = time.time()
     a6 = plain(model, a0, adapter_on=True, **kw)
+    a6_rate = sum(len(v[0]) for v in a6.values()) / (time.time() - t1)
     sec = time.time() - t0
     base = {t["pid"]: t for t in a0}
-    arms = {"A0": {}, "A2": a2, "A3": a3, "A6": a6}
     out = {}
-    for arm, over in arms.items():
+    for arm, over in {"A0": {}, "A2": a2, "A3": a3, "A6": a6}.items():
         rows = []
         for t in a0:
             gen, trunc = over.get(t["pid"], (t["gen"], t["truncated"]))
             r = ctx.trace(t["pid"], t["prompt"], gen, trunc) if t["pid"] in over else t
-            rows.append({"set": t["set"], "a0_ok": base[t["pid"]]["ok"], "ok": r["ok"], "ok_lenient": r["ok_lenient"],
+            rows.append({"set": t["set"], "a0_ok": base[t["pid"]]["ok"], "ok": r["ok"], "ok_strict": r["ok_strict"],
                          "flagged": bool(flags[t["pid"]]) and arm in ("A2", "A3"), "a0_tokens": len(t["gen"]),
                          "tokens": len(gen), "truncated": trunc})
         out[arm] = rows
     ctx.save(d, "arms", out)
-    m ={"s8_sec": sec, "s8_traces": sum(len(v) for v in (a2, a3, a6)), "s8_flagged": sum(1 for v in flags.values() if v)}
+    m = {"s8_sec": sec, "s8_traces": sum(len(v) for v in (a2, a3, a6)), "s8_a6_tok_per_s": a6_rate,
+         "s8_flagged": sum(1 for v in flags.values() if v), "s8_adapter_trained": ctx.probe_gate()}
     for arm, rows in out.items():
         m[f"eval_{arm}"] = arm_metrics(rows)
         for s in SETS:
             sub = [r for r in rows if r["set"] == s]
-            m[f"eval_{arm}_{s}_strict"] = _rate(sub, "ok")
-            m[f"eval_{arm}_{s}_lenient"] = _rate(sub, "ok_lenient")
+            m[f"eval_{arm}_{s}_primary"] = _rate(sub, "ok")
+            m[f"eval_{arm}_{s}_strict"] = _rate(sub, "ok_strict")
     return m
 
 
-STAGES = [("S1", s1), ("S2", s2), ("S3", s3), ("S4", s4), ("S5", s5), ("S6", s6), ("S7", s7), ("S8", s8)]
+STAGES = [("S1", s1), ("S1rc", s1rc), ("S2", s2), ("S3", s3), ("S4", s4), ("S5", s5), ("S6", s6), ("S7", s7),
+          ("S8", s8)]

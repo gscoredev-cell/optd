@@ -51,6 +51,12 @@ def test_eval_expr_follows_string_not_tree():
     assert data.eval_expr("10-2+3") == 11
 
 
+@pytest.mark.parametrize("ops", [3, 4, 5])
+def test_random_calculation_fixed_ops_levels(ops):
+    a = data.random_calculation(60, seed=100 + ops, min_ops=ops, max_ops=ops)
+    assert len(a) == 60 and all(p["ops"] == ops for p in a)
+
+
 def test_random_calculation():
     a = data.random_calculation(100, seed=0)
     assert a == data.random_calculation(100, seed=0)

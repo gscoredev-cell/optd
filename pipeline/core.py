@@ -71,6 +71,20 @@ def matches(pred, gold):
     return abs(v - gold) <= Fraction(1, 2 * 10 ** dec)
 
 
+def primary_ok(text, gold, truncated):
+    """Primary rule (§8.3): lenient answer (strict, else last number) matches gold and the trace was not truncated."""
+    return not truncated and matches(extract_lenient(text), gold)
+
+
+def group_kfold(groups, k=5, seed=0):
+    """k (train_idx, val_idx) folds over item indices; every group (original_id) lands in exactly one val fold."""
+    uniq = sorted(set(groups))
+    random.Random(seed).shuffle(uniq)
+    fold = {g: i % k for i, g in enumerate(uniq)}
+    return [([i for i, g in enumerate(groups) if fold[g] != f], [i for i, g in enumerate(groups) if fold[g] == f])
+            for f in range(k)]
+
+
 def gold_gsm(answer):
     """GSM answers end with '#### <number>'."""
     return _frac(answer.rsplit("####", 1)[1].strip())

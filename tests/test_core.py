@@ -48,6 +48,27 @@ def test_matches_precision_and_exact_forms():
     assert not core.matches(None, Fraction(18))
 
 
+def test_primary_rule_lenient_and_truncated_is_wrong():
+    g = Fraction(18)
+    assert core.primary_ok("so we get 18", g, truncated=False)             # last number counts
+    assert not core.primary_ok("so we get 18", g, truncated=True)          # truncated is always wrong
+    assert core.primary_ok("The final answer is 18\nthen 99", g, False)    # strict answer wins over last number
+    assert not core.primary_ok("no number", g, False)
+
+
+def test_group_kfold():
+    groups = [i // 3 for i in range(60)]                                   # 20 groups x 3 items
+    folds = core.group_kfold(groups, k=5)
+    assert len(folds) == 5
+    seen = []
+    for tr, va in folds:
+        assert set(tr).isdisjoint(va) and len(tr) + len(va) == 60
+        assert {groups[i] for i in tr}.isdisjoint({groups[i] for i in va})   # no group on both sides
+        seen += va
+    assert sorted(seen) == list(range(60))                                 # each item validated exactly once
+    assert core.group_kfold(groups) == folds
+
+
 def test_gold_gsm():
     assert core.gold_gsm("Tom has 3 + 4 = 7 apples.\n#### 1,207") == 1207
 

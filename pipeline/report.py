@@ -4,14 +4,22 @@ import math
 import os
 import time
 
+# Fallbacks for stages SMOKE-2 may skip, measured in SMOKE-20261030-1807-6462834 (L40, tier 48).
+SMOKE1_TEACHER_PREFILL_TOK_PER_S = 4425.3
+SMOKE1_TRAIN_SEC_PER_STEP = 1 / 0.4729
+
+
+def _bad(x):
+    return x is None or (isinstance(x, float) and math.isnan(x))
+
 
 def _p(x):
     """Rate as percent with one decimal."""
-    return "nan" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{100 * x:.1f}%"
+    return "nan" if _bad(x) else f"{100 * x:.1f}%"
 
 
 def _n(x, nd=3):
-    return "nan" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.{nd}f}"
+    return "nan" if _bad(x) else f"{x:.{nd}f}"
 
 
 def header(run_dir, m, cfg):
@@ -73,21 +81,29 @@ def envcheck(run_dir, m, cfg):
 
 
 def _projection(m):
-    """Rough linear FULL projection per seed from SMOKE unit times (§10 FULL sizes; 3 rounds; 2 interventions)."""
-    per_gen = m["s2_sec"] / max(m["s2_n"], 1)
-    per_probe = m["S3_min"] * 60 / max(m["s2_n"], 1)
+    """Rough FULL projection per seed (§10 FULL sizes: 7000 train prompts, greedy + 1 sample, 3 rounds x 4
+    continuations of flagged-wrong traces, 1800 test problems, arms A0-A6 with 2 interventions, A5 k = 5) from SMOKE
+    token counts and measured tokens/s. Returns (hours, parts in hours)."""
+    T = m["s2_mean_tokens"]
     final = m["s1_max_new_final"]
-    per_s1 = (m[f"s1_student_sec_{final}"] + m[f"s1_teacher_sec_{final}"]) / max(sum(m["s1_n"].values()), 1)
-    per_cont = (m["S5_min"] + m["S6_min"]) * 60 / max(m["s5_continuations"], 1)
-    per_step = 1 / m["train_steps_per_s"] if m.get("train_steps_per_s") else 0.0
-    per_eval = m["s8_sec"] / max(m["s8_traces"], 1)
-    flag_wrong = m["s5_flagged_wrong"] / 300
+    gen_g, gen_s = m["s2_greedy_tok_per_s"], m["s2_sample_tok_per_s"]
+    prefill = m.get("s6_prefill_tok_per_s") or SMOKE1_TEACHER_PREFILL_TOK_PER_S
+    step = 1 / m["train_steps_per_s"] if m.get("train_steps_per_s") else SMOKE1_TRAIN_SEC_PER_STEP
+    flag_wrong = m["s3_flagged_wrong_greedy"] / 300
     interv = m["s8_flagged"] / max(sum(m["s1_n"].values()), 1)
-    train_prompts, test = 7000, 1800
-    conts = flag_wrong * train_prompts * 4
-    sec = (per_gen * 2 * train_prompts + per_probe * 2 * train_prompts + 3 * (per_cont * conts + per_step * conts / 16)
-           + per_s1 * test + per_eval * test * (5 + 1 + 4 * 2 * interv))
-    return sec / 3600
+    n_train, n_test = 7000, 1800
+    conts = 3 * flag_wrong * n_train * 4
+    parts = {
+        "rollouts": n_train * T / gen_g + n_train * T / gen_s,
+        "features": m["s3_feat_sec"] * 2 * n_train / m["s2_n"],
+        "continuations": conts * T / gen_s,
+        "teacher_scoring": conts * (2 * T + 150) / prefill,
+        "training": conts / 16 * step,
+        "headroom": n_test * T / m[f"s1_student_tok_per_s_{final}"] + n_test * T / m[f"s1_teacher_tok_per_s_{final}"],
+        "arms": n_test * T * (4 * 2 * interv + 5) / gen_s + n_test * T / gen_g,
+    }
+    parts = {k: v / 3600 for k, v in parts.items()}
+    return sum(parts.values()), parts
 
 
 def smoke(run_dir, m, cfg):
@@ -95,68 +111,102 @@ def smoke(run_dir, m, cfg):
     price = m["price_per_hr"]
     sets = ("p2", "main", "p1", "rc")
     n = m["s1_n"]
+    trained = m.get("s8_adapter_trained")
 
     def acc(who):
-        return " / ".join(f"{s} (n={n[s]}) {_p(m[f's1_{who}_{s}_strict'])}/{_p(m[f's1_{who}_{s}_lenient'])}"
+        return " / ".join(f"{s} (n={n[s]}) {_p(m[f's1_{who}_{s}_primary'])}/{_p(m[f's1_{who}_{s}_strict'])}"
                           for s in sets)
 
     trunc = " ; ".join(f"{k} tokens: " + ", ".join(f"{w} {_p(v)}" for w, v in m[f"s1_trunc_{k}"].items())
                        for k in m["s1_max_new_tried"])
+    rc = " ; ".join(f"{k} ops: student {_p(m[f'rc_cal_{k}']['student_acc'])} (trunc {_p(m[f'rc_cal_{k}']['student_trunc'])})"
+                    f", teacher {_p(m[f'rc_cal_{k}']['teacher_acc'])} (trunc {_p(m[f'rc_cal_{k}']['teacher_trunc'])})"
+                    for k in (3, 4, 5))
+    table = m.get("probe_table", {})
+    rows = []
+    for name in dict.fromkeys(k.split("|")[0] for k in table):
+        cells = [f"C={k.split('C=')[1]} cv {_n(v['cv_auroc'])}" + (f" held-out {_n(v['heldout_auroc'])}"
+                 if "heldout_auroc" in v else "") for k, v in table.items() if k.startswith(name + "|")]
+        rows.append(f"  {name}: " + " ; ".join(cells))
     restart = m.get("probe_restart_share")
-    hours = _projection(m)
+    tol_l = sorted(m.get("tol_gen_vs_b1_bf16", {}), key=int)
+    pick = [l for l in tol_l if int(l) in (7, 14, 21, 28)]
+    hours, parts = _projection(m)
     blockers = [m[k] for k in ("probe_blocker", "train_blocker") if m.get(k)]
     if not m.get("identity_equal"):
-        blockers.append(f"identity failed (max token diff {m.get('identity_max_token_diff')})")
+        blockers.append(f"identity failed (n {m.get('identity_n')}, max token diff {m.get('identity_max_token_diff')})")
     if m.get("resume_ok") is False:
         blockers.append(f"resume mismatch (max rel diff {_n(m.get('resume_max_rel_diff'), 5)})")
-    if m.get("s3_state_tol", 0) > 1e-2:
-        blockers.append(f"prefill-vs-generation state tolerance {_n(m['s3_state_tol'], 4)} > 1e-2")
+    if m.get("rc_ops_choice") is None:
+        blockers.append("RandomCalculation: no ops level with teacher >= 60% and truncation <= 5%")
+    if not m.get("probe_gate"):
+        blockers.append("probe gate failed: FULL not cleared (decide probe-mc labels vs Qwen3-4B student)")
     gates = {
         "headroom (gap >= 8 pts)": m["s1_gap_p2"] >= 0.08,
-        "base rate in [20%, 85%]": 0.20 <= m["s2_greedy_strict"] <= 0.85,
-        "probe AUROC >= 0.80 and recall >= 0.40": (m.get("probe_auroc") or 0) >= 0.80 and (m.get("probe_recall") or 0) >= 0.40,
+        "base rate in [20%, 85%]": 0.20 <= m["s2_greedy_primary"] <= 0.85,
+        "probe AUROC >= 0.80 and recall >= 0.40 at FPR 10%": bool(m.get("probe_gate")),
         "identity": bool(m.get("identity_equal")),
-        "resume": m.get("resume_ok") is True,
+        "resume": m.get("resume_ok") is True if trained else None,
+        "RC calibrated": m.get("rc_ops_choice") is not None,
         "timing (<= 900 min/pod)": hours * 60 <= 900,
     }
     eval_lines = []
     for arm in ("A0", "A2", "A3", "A6"):
         e = m[f"eval_{arm}"]
-        per_set = ", ".join(f"{s} {_p(m[f'eval_{arm}_{s}_strict'])}" for s in sets)
-        eval_lines.append(f"  {arm}: strict {per_set} ; recovered {e['recovered']} ; broken {e['broken']} ; "
+        per_set = ", ".join(f"{s} {_p(m[f'eval_{arm}_{s}_primary'])}/{_p(m[f'eval_{arm}_{s}_strict'])}" for s in sets)
+        eval_lines.append(f"  {arm}: primary/strict {per_set} ; recovered {e['recovered']} ; broken {e['broken']} ; "
                           f"net {e['net']} ; interv. rate {_p(e['interv_rate'])} ; FPR {_p(e['fpr'])} ; "
                           f"extra tokens {_n(e['extra_tokens'], 1)} ; truncation {_p(e['trunc_rate'])}")
+    final = m["s1_max_new_final"]
+    skipped = "skipped (probe gate failed)"
     lines += [
-        f"TIMING (min): S1 {m['S1_min']} | S2 {m['S2_min']} | S3 {m['S3_min']} | S4 {m['S4_min']} | S5 {m['S5_min']} | "
-        f"S6 {m['S6_min']} | S7 {m['S7_min']} | S8 {m['S8_min']} | total {m['elapsed_min']:.2f}",
-        f"HEADROOM strict/lenient: student {acc('student')} ; teacher {acc('teacher')} ; "
-        f"gap p2 {100 * m['s1_gap_p2']:.1f} ± {100 * m['s1_gap_p2_se']:.1f} pts (paired SE) ; "
-        f"max_new_tokens tried {m['s1_max_new_tried']} -> {m['s1_max_new_final']} ; truncation {trunc}",
-        f"ROLLOUTS: n {m['s2_n']} | strict acc greedy {_p(m['s2_greedy_strict'])} / sampled {_p(m['s2_sampled_strict'])} | "
-        f"mean tokens {_n(m['s2_mean_tokens'], 1)} | mean boundaries {_n(m['s2_mean_boundaries'], 2)} | "
-        f"truncation {_p(m['s2_trunc'])}",
-        f"PROBE: layer {m.get('probe_layer')} | AUROC {_n(m.get('probe_auroc'))} (by layer "
-        f"{ {k: round(v, 3) for k, v in m.get('probe_auroc_by_layer', {}).items()} }) | tau {_n(m.get('probe_tau'), 4)} | "
-        f"FPR {_p(m.get('probe_fpr'))} | recall {_p(m.get('probe_recall'))} | restart share {_p(restart)}"
-        f"{' (> 60%: the detector is acting as a difficulty estimator)' if restart and restart > 0.6 else ''} | "
-        f"first-flag histogram {m.get('probe_first_flag_hist')} | held-out traces {m.get('probe_holdout_traces')}",
-        f"IDENTITY: A3-untrained == A2 {'y' if m.get('identity_equal') else 'n'} (n {m.get('identity_n')}, max token diff "
-        f"{m.get('identity_max_token_diff')}) ; prefill-vs-generation state tolerance {_n(m.get('s3_state_tol'), 5)} "
-        f"(max rel L2, limit 1e-2)",
-        f"REPAIR DATA: flagged-wrong {m['s5_flagged_wrong']} (used {m['s5_problems']}) | continuations "
-        f"{m['s5_continuations']} (strict {_p(m['s5_strict'])}, truncation {_p(m['s5_trunc'])}) | teacher-also-wrong "
-        f"{_p(m['s6_teacher_also_wrong'])}",
-        f"TRAIN: steps {m['train_steps']} | loss start/end {_n(m.get('loss_start'), 4)}/{_n(m.get('loss_end'), 4)} | "
-        f"resume check {'y' if m.get('resume_ok') else 'n' if m.get('resume_ok') is False else 'n/a'} "
-        f"(kill at {m.get('train_kill_at')}, checkpoint every {m.get('train_ckpt_every')}, max rel diff "
-        f"{_n(m.get('resume_max_rel_diff'), 6)}) | adapter params {m['adapter_params']}",
-        f"EVAL ({sum(n.values())}):",
+        "SCORING: primary = lenient (strict answer, else last number), truncated = wrong ; strict = secondary",
+        "TIMING (min): " + " | ".join(f"{s} {m[f'{s}_min']}" for s in
+                                      ("S1", "S1rc", "S2", "S3", "S4", "S5", "S6", "S7", "S8"))
+        + f" | total {m['elapsed_min']:.2f}",
+        f"HEADROOM primary/strict: student {acc('student')} ; teacher {acc('teacher')} ; "
+        f"gap p2 (primary) {100 * m['s1_gap_p2']:.1f} ± {100 * m['s1_gap_p2_se']:.1f} pts (paired SE) ; "
+        f"max_new_tokens tried {m['s1_max_new_tried']} -> {final} ; truncation {trunc}",
+        f"RC CALIBRATION (60 per level, 800 tokens, primary): {rc} ; choice for FULL eval and train prompts: "
+        f"{m.get('rc_ops_choice') if m.get('rc_ops_choice') is not None else 'none qualifies'} ops "
+        f"(rule: largest level with teacher >= 60% and truncation <= 5%)",
+        f"ROLLOUTS: n {m['s2_n']} | primary acc greedy {_p(m['s2_greedy_primary'])} / sampled "
+        f"{_p(m['s2_sampled_primary'])} (strict greedy {_p(m['s2_greedy_strict'])}) | mean tokens "
+        f"{_n(m['s2_mean_tokens'], 1)} | mean boundaries {_n(m['s2_mean_boundaries'], 2)} | truncation {_p(m['s2_trunc'])}",
+        f"PROBE: layers {m.get('probe_layers')} | C {m.get('probe_C')} | AUROC held-out {_n(m.get('probe_auroc'))} "
+        f"(cv {_n(m.get('probe_cv_auroc'))}) | tau {m.get('probe_tau')} | FPR {_p(m.get('probe_fpr'))} | recall "
+        f"{_p(m.get('probe_recall'))} | restart share {_p(restart)}"
+        f"{' (> 60%: the detector is acting as a difficulty estimator)' if not _bad(restart) and restart > 0.6 else ''}"
+        f" | first-flag histogram {m.get('probe_first_flag_hist')} | held-out traces {m.get('probe_holdout_traces')} "
+        f"({m.get('probe_holdout_wrong')} wrong) | features fp32 prefill, batch 8",
+        "PROBE AUROC TABLE (5-fold CV grouped by original_id on train ids; held-out at each set's best C):",
+        *rows,
+        f"IDENTITY: A3-untrained == A2 {'y' if m.get('identity_equal') else 'n'} (n {m.get('identity_n')}, max token "
+        f"diff {m.get('identity_max_token_diff')})",
+        f"STATE TOLERANCE (informational; max rel L2 vs generation states at {m.get('tol_boundaries')} boundaries): "
+        f"batch-1 unpadded bf16 prefill max {_n(m.get('tol_max_b1'), 5)} (layers "
+        + ", ".join(f"{l}: {_n(m['tol_gen_vs_b1_bf16'][l], 5)}" for l in pick)
+        + f") ; fp32 batch-8 prefill max {_n(m.get('tol_max_fp32'), 5)} (layers "
+        + ", ".join(f"{l}: {_n(m['tol_gen_vs_fp32_batched'][l], 5)}" for l in pick) + ")",
+        ("REPAIR DATA: " + skipped) if m.get("skipped") and not trained else
+        f"REPAIR DATA: flagged-wrong {m.get('s5_flagged_wrong')} (used {m.get('s5_problems')}) | continuations "
+        f"{m.get('s5_continuations')} (primary {_p(m.get('s5_primary'))}, truncation {_p(m.get('s5_trunc'))}) | "
+        f"teacher-also-wrong {_p(m.get('s6_teacher_also_wrong'))}",
+        ("TRAIN: " + skipped) if not trained else
+        f"TRAIN: steps {m.get('train_steps')} | loss start/end {_n(m.get('loss_start'), 4)}/{_n(m.get('loss_end'), 4)} "
+        f"| resume check {'y' if m.get('resume_ok') else 'n' if m.get('resume_ok') is False else 'n/a'} (kill at "
+        f"{m.get('train_kill_at')}, checkpoint every {m.get('train_ckpt_every')}, max rel diff "
+        f"{_n(m.get('resume_max_rel_diff'), 6)}) | adapter params {m.get('adapter_params')}",
+        f"EVAL ({sum(n.values())}){'' if trained else ' — adapter untrained (S7 skipped): A3 ~ A2, A6 ~ A0'}:",
         *eval_lines,
-        f"THROUGHPUT: gen tok/s {_n(m['s2_n'] * m['s2_mean_tokens'] / m['s2_sec'], 1)} (S2, batch incl. sampling) | "
-        f"teacher prefill tok/s {_n(m.get('s6_prefill_tok_per_s'), 1)} | train steps/s {_n(m.get('train_steps_per_s'), 4)}",
-        f"PROJECTION: FULL {hours:.1f} h and ${hours * price:.2f} per seed on this tier (rough linear estimate; "
-        f"ceiling 15 h/pod)",
-        "GATES (informational in SMOKE): " + " ; ".join(f"{k} {'pass' if v else 'fail'}" for k, v in gates.items()),
+        f"THROUGHPUT (HF generate, tok/s): S1 student {_n(m[f's1_student_tok_per_s_{final}'], 1)} / teacher "
+        f"{_n(m[f's1_teacher_tok_per_s_{final}'], 1)} | S2 greedy {_n(m['s2_greedy_tok_per_s'], 1)} / sampled "
+        f"{_n(m['s2_sample_tok_per_s'], 1)} | S8 A6 {_n(m.get('s8_a6_tok_per_s'), 1)} | teacher prefill "
+        f"{_n(m.get('s6_prefill_tok_per_s'), 1) if m.get('s6_prefill_tok_per_s') else f'{SMOKE1_TEACHER_PREFILL_TOK_PER_S} (SMOKE-1)'}"
+        f" | train steps/s {_n(m.get('train_steps_per_s'), 4) if m.get('train_steps_per_s') else f'{1 / SMOKE1_TRAIN_SEC_PER_STEP:.4f} (SMOKE-1)'}",
+        f"PROJECTION: FULL {hours:.1f} h and ${hours * price:.2f} per seed on this tier (rough; "
+        + ", ".join(f"{k} {v:.1f} h" for k, v in parts.items()) + "; ceiling 15 h/pod)",
+        "GATES: " + " ; ".join(f"{k} {'pass' if v else 'n/a' if v is None else 'fail'}" for k, v in gates.items()),
         f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} "
         f"<= ${cfg['phase_budget_usd'][env['phase']]}",
         "BLOCKERS: " + ("; ".join(blockers) if blockers else "none"),
