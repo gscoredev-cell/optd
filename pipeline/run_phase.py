@@ -170,6 +170,20 @@ def main():
                 run_stage(run_dir, name, lambda d, fn=fn: fn(ctx, d), m)
             write_status(run_dir, "report")
             report.smoke(run_dir, m, cfg)
+        elif a.phase == "SMOKE6":
+            import option_e
+            import smoke
+            c6 = option_e.Ctx6(cfg, tiers, a.tier, a.run_id, run_dir)
+            c6.metrics = m
+            for name, fn in option_e.STAGES:   # E-S3 (validation) runs last and is optional; a failure never costs the report
+                try:
+                    run_stage(run_dir, name, lambda d, fn=fn: fn(c6, d), m)
+                except Exception as e:
+                    m[f"{name}_skipped"] = f"error: {type(e).__name__}: {(str(e).splitlines() or [''])[0][:200]}"
+                    print(f"== stage {name} failed: {m[f'{name}_skipped']}")
+                    smoke.free()
+            write_status(run_dir, "report")
+            report.option_e(run_dir, m, cfg)
         elif a.phase in ("SMOKE3", "SMOKE4", "SMOKE5"):
             import importlib
             import smoke
