@@ -129,6 +129,22 @@ def test_tau_at_fpr_is_smallest_threshold_with_fpr_at_most_10pct():
     assert sum(x >= t for x in ties) == 1
 
 
+def test_tau_weighted_matches_unweighted_and_reweights():
+    neg = [i / 10 for i in range(1, 11)]
+    assert core.tau_at_fpr_weighted(neg, [1.0] * 10) == core.tau_at_fpr(neg)
+    ties = [0.5] * 9 + [0.9]
+    assert core.tau_at_fpr_weighted(ties, [1.0] * 10) == core.tau_at_fpr(ties)
+    # the top score carries 30% of the weight: it alone exceeds a 10% budget, so the threshold must exclude it
+    w = [7 / 9] * 9 + [3.0]
+    t = core.tau_at_fpr_weighted(neg, w)
+    assert t > 1.0 and sum(wi for s, wi in zip(neg, w) if s >= t) == 0
+
+
+def test_set_weights():
+    w = core.set_weights(["main", "main", "p1", "rc"], {"main": 0.25, "p1": 0.25, "rc": 0.5})
+    assert w == [0.5, 0.5, 1.0, 2.0]   # held-out shares 0.5/0.25/0.25 -> eval shares 0.25/0.25/0.5
+
+
 def test_auroc():
     assert core.auroc([0.9, 0.8], [0.1, 0.2]) == 1.0
     assert core.auroc([0.1], [0.9]) == 0.0

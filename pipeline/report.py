@@ -106,6 +106,134 @@ def _projection(m):
     return sum(parts.values()), parts
 
 
+def _table(prefix, m, key):
+    """AUROC table lines from a probe_table / step_table dict."""
+    table = m.get(prefix + key) or {}
+    out = []
+    for name in dict.fromkeys(k.split("|")[0] for k in table):
+        cells = [f"C={k.split('C=')[1]} cv {_n(v['cv_auroc'])}" + (f" held-out {_n(v['heldout_auroc'])}"
+                 if "heldout_auroc" in v else "") for k, v in table.items() if k.startswith(name + "|")]
+        out.append(f"    {name}: " + " ; ".join(cells))
+    return out
+
+
+def _fpr(d):
+    if not d:
+        return "n/a"
+    return " ; ".join(f"{s} {_p(v['fpr'])} (n {v['n_correct']})" for s, v in d.items())
+
+
+def _by_set(d, key):
+    return " ; ".join(f"{s} {_n(v[key]) if key == 'auroc' else _p(v[key])} (n {v['n']}, wrong {v['wrong']})"
+                      for s, v in (d or {}).items()) or "n/a"
+
+
+def _probe_lines(p, m, label):
+    if m.get(p + "probe_layers") is None:
+        return [f"  {label}: {m.get(p + 'probe_blocker', 'not run')}"]
+    return [
+        f"  {label}: layers {m[p + 'probe_layers']} | C {m[p + 'probe_C']} | held-out AUROC {_n(m[p + 'probe_auroc'])} "
+        f"(cv {_n(m[p + 'probe_cv_auroc'])}) | recall {_p(m[p + 'probe_recall'])} at held-out FPR "
+        f"{_p(m[p + 'probe_fpr'])} (tau {_n(m[p + 'probe_tau'], 4)}, eval-mix weighted "
+        f"{'y' if m.get(p + 'probe_tau_weighted') else 'n'}) | restart share {_p(m.get(p + 'probe_restart_share'))} | "
+        f"gate {'pass' if m.get(p + 'probe_gate') else 'fail'}",
+        f"    held-out AUROC per set: {_by_set(m.get(p + 'probe_by_set'), 'auroc')}",
+        f"    held-out FPR per set at tau: {_by_set(m.get(p + 'probe_by_set'), 'fpr')}",
+        f"    eval (test traces) FPR per set at tau: {_fpr(m.get(p + 'probe_eval_fpr'))}",
+        "    AUROC table (grouped 5-fold CV on train ids; held-out at each set's best C):",
+        *_table(p, m, "probe_table"),
+    ]
+
+
+def smoke3(run_dir, m, cfg):
+    env, _, lines = header(run_dir, m, cfg)
+    price = m["price_per_hr"]
+    sets = ("p2", "main", "p1", "rc")
+    stages = ("MCa", "MCprobe", "B1", "B2", "B3", "C2", "C3")
+    skipped = {s: m.get(f"{s}_skipped") for s in stages if m.get(f"{s}_skipped")}
+    lines += [
+        f"SOURCE: SMOKE-2 artifacts from {cfg['smoke3_source_run']} (S2 greedy traces, S1 A0 traces, S1 teacher) ; "
+        f"scoring primary (lenient, truncated = wrong) ; RC for FULL: {cfg['rc_ops_full']} ops",
+        "TIMING (min): " + " | ".join(f"{s} {m.get(f'{s}_min')}" for s in stages) + f" | total {m['elapsed_min']:.2f}",
+        "(a) PROBE-MC (Qwen3-1.7B, SMOKE-2 greedy train traces, 3 completions per point, T 0.8, cap 800):",
+    ]
+    if "MCa_skipped" in m:
+        lines.append(f"  {m['MCa_skipped']}")
+    else:
+        lines += [
+            f"  labels: traces {m.get('mc_traces')}/{m.get('mc_of')} | completions {m.get('mc_completions')} | "
+            f"tok/s {_n(m.get('mc_tok_per_s'), 1)} | bad steps {m.get('mc_step_pos')} | traces with a bad step "
+            f"{m.get('mc_traces_with_bad_step')} | wrong traces {m.get('mc_wrong_traces')} (with a bad step "
+            f"{m.get('mc_wrong_with_bad_step')}) | MC success at the prompt: correct traces "
+            f"{_n(m.get('mc_prompt_success_correct'))}, wrong traces {_n(m.get('mc_prompt_success_wrong'))}",
+        ]
+        if m.get("step_layers") is None:
+            lines.append(f"  step probe: {m.get('MCprobe_skipped') or m.get('step_blocker', 'not run')} "
+                         f"(positives train {m.get('step_pos_train')}, held-out {m.get('step_pos_heldout')})")
+        else:
+            lines += [
+                f"  step probe: layers {m['step_layers']} | C {m['step_C']} | step AUROC held-out "
+                f"{_n(m['step_auroc'])} (cv {_n(m['step_cv_auroc'])}; positives train {m['step_pos_train']}/"
+                f"{m['step_boundaries_train']}, held-out {m['step_pos_heldout']}/{m['step_boundaries_heldout']}) | "
+                f"first bad step within +-1 {_p(m['step_first_bad_within1'])} (n {m['step_heldout_traces_with_bad']}) | "
+                f"implied trace AUROC {_n(m['step_trace_auroc'])} | tau {_n(m['step_tau'], 4)}",
+                f"    eval (test traces) FPR per set at step tau: {_fpr(m.get('step_eval_fpr'))}",
+                "    step AUROC table:", *_table("", m, "step_table"),
+            ]
+    lines.append("(b) QWEN3-4B STUDENT:")
+    if "B1_skipped" in m:
+        lines.append(f"  S1: {m['B1_skipped']}")
+    else:
+        lines.append(
+            "  S1 (380, 800 tokens, teacher from SMOKE-2) primary/strict, student vs teacher: " + " / ".join(
+                f"{s} {_p(m[f'b1_student_{s}_primary'])}/{_p(m[f'b1_student_{s}_strict'])} vs "
+                f"{_p(m[f'b1_teacher_{s}_primary'])} (trunc {_p(m[f'b1_student_{s}_trunc'])})" for s in sets)
+            + f" ; gap p2 (primary) {100 * m['b1_gap_p2']:.1f} ± {100 * m['b1_gap_p2_se']:.1f} pts ; "
+              f"tok/s {_n(m['b1_tok_per_s'], 1)} ; 4B/8B prompt token ids identical {m.get('b1_template_identical')}/20")
+    if "B2_skipped" in m:
+        lines.append(f"  S2: {m['B2_skipped']}")
+    else:
+        lines.append(
+            f"  S2: problems {m['b2_n_problems']}/{m['b2_of']} x 2 | base rate (greedy primary) "
+            f"{_p(m['b2_greedy_primary'])} (" + ", ".join(f"{s} {_p(m[f'b2_greedy_primary_{s}'])}"
+                                                           for s in ("main", "p1", "p2", "rc"))
+            + f") | sampled {_p(m['b2_sampled_primary'])} | truncation {_p(m['b2_trunc'])} | mean tokens "
+              f"{_n(m['b2_mean_tokens'], 1)} | tok/s {_n(m['b2_tok_per_s'], 1)}")
+    lines += [f"  S3: {m['B3_skipped']}"] if "B3_skipped" in m else _probe_lines("b3_", m, "S3")
+    lines.append("(c) DATA SCALING (Qwen3-1.7B):")
+    if "C2_skipped" in m:
+        lines.append(f"  S2: {m['C2_skipped']}")
+    else:
+        lines.append(
+            f"  S2: problems {m['c2_n_problems']}/{m['c2_of']} x 2 | base rate (greedy primary) "
+            f"{_p(m['c2_greedy_primary'])} (" + ", ".join(f"{s} {_p(m[f'c2_greedy_primary_{s}'])}"
+                                                           for s in ("main", "p1", "p2", "rc"))
+            + f") | truncation {_p(m['c2_trunc'])} | mean tokens {_n(m['c2_mean_tokens'], 1)} | tok/s "
+              f"{_n(m['c2_tok_per_s'], 1)}")
+    if "C3_skipped" in m:
+        lines.append(f"  S3: {m['C3_skipped']}")
+    else:
+        lines.append("  curve (layer 21, C by grouped CV, fixed held-out groups; AUROC pooled | per set | recall):")
+        for c in m.get("c3_curve", []):
+            if c.get("skipped"):
+                lines.append(f"    {c['total']} traces: {c['skipped']}")
+                continue
+            per = ", ".join(f"{s} {_n(v)}" for s, v in (c.get("by_set") or {}).items())
+            lines.append(f"    {c['total']} traces (train {c['train_traces']}, held-out {c['heldout_traces']}, C "
+                         f"{c['C']}): AUROC {_n(c['auroc'])} | {per} | recall {_p(c['recall'])}")
+        lines += _probe_lines("c3_", m, "full protocol at 2,400 traces")
+    gates = {k: m.get(k) for k in ("b3_probe_gate", "c3_probe_gate")}
+    lines += [
+        "GATE (AUROC >= 0.80 and recall >= 0.40 at FPR 10% on held-out ids): "
+        + " ; ".join(f"{k.split('_')[0]} {'pass' if v else 'fail' if v is not None else 'n/a'}"
+                     for k, v in gates.items()),
+        f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} "
+        f"<= ${cfg['phase_budget_usd'][env['phase']]}",
+        "BLOCKERS: " + ("; ".join(f"{s} {v}" for s, v in skipped.items()) if skipped else "none"),
+    ]
+    _write(run_dir, lines, m)
+
+
 def smoke(run_dir, m, cfg):
     env, _, lines = header(run_dir, m, cfg)
     price = m["price_per_hr"]

@@ -132,6 +132,29 @@ def tau_at_fpr(neg_scores, fpr=0.10):
     return s[-1] if k >= len(s) else math.nextafter(s[k], math.inf)
 
 
+def tau_at_fpr_weighted(neg_scores, weights, fpr=0.10):
+    """Smallest t with weighted share(neg >= t) <= fpr; weights reweight held-out negatives to the eval's set mix.
+    With equal weights this equals tau_at_fpr."""
+    vals = sorted(set(neg_scores), reverse=True)
+    w_at = {}
+    for s, w in zip(neg_scores, weights):
+        w_at[s] = w_at.get(s, 0.0) + w
+    budget, above, t = fpr * sum(weights) + 1e-12, 0.0, None
+    for v in vals:                 # threshold just above v flags everything strictly above v
+        if above > budget:
+            break
+        t = math.nextafter(v, math.inf)
+        above += w_at[v]
+    return t
+
+
+def set_weights(sets, eval_share):
+    """Per-item weight = eval share of its set / held-out share of its set (sets missing from eval_share get 0)."""
+    n = len(sets)
+    have = {s: sets.count(s) / n for s in set(sets)}
+    return [eval_share.get(s, 0.0) / have[s] for s in sets]
+
+
 def auroc(pos_scores, neg_scores):
     """P(pos > neg) + 0.5 P(tie), by ranks."""
     allv = sorted([(v, 1) for v in pos_scores] + [(v, 0) for v in neg_scores])

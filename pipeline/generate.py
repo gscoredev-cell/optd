@@ -83,11 +83,15 @@ def decode(model, seqs, max_new, eos, pad, sample=False, seed=0, temperature=0.8
     return toks, trunc, states
 
 
-def decode_batches(model, seqs, bs, max_new, eos, pad, seed_fn=None, budgets=None, **kw):
+def decode_batches(model, seqs, bs, max_new, eos, pad, seed_fn=None, budgets=None, deadline=None, **kw):
     """decode() over consecutive chunks of bs rows (callers pass rows sorted by pid, so A2 and A3 get identical
-    batches). seed_fn(chunk_index) gives each chunk's sampling seed. budgets (per row) trims each row to its own max."""
+    batches). seed_fn(chunk_index) gives each chunk's sampling seed. budgets (per row) trims each row to its own max.
+    deadline (epoch s): no new chunk starts after it, so the result may cover only a prefix of seqs."""
+    import time
     toks, trunc = [], []
     for c, i in enumerate(range(0, len(seqs), bs)):
+        if deadline and time.time() > deadline:
+            break
         chunk = seqs[i:i + bs]
         b = [max(1, x) for x in budgets[i:i + bs]] if budgets else [max_new] * len(chunk)
         t, _, _ = decode(model, chunk, max(b), eos, pad, seed=seed_fn(c) if seed_fn else 0, **kw)

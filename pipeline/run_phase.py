@@ -169,6 +169,18 @@ def main():
                 run_stage(run_dir, name, lambda d, fn=fn: fn(ctx, d), m)
             write_status(run_dir, "report")
             report.smoke(run_dir, m, cfg)
+        elif a.phase == "SMOKE3":
+            import smoke3
+            c3 = smoke3.Ctx3(cfg, tiers, a.tier, a.run_id, run_dir)
+            for name, fn in smoke3.STAGES:   # diagnostic parts are independent: a failing one must not cost the report
+                try:
+                    run_stage(run_dir, name, lambda d, fn=fn: fn(c3, d), m)
+                except Exception as e:
+                    m[f"{name}_skipped"] = f"error: {type(e).__name__}: {(str(e).splitlines() or [''])[0][:200]}"
+                    print(f"== stage {name} failed: {m[f'{name}_skipped']}")
+                    smoke3.smoke.free()
+            write_status(run_dir, "report")
+            report.smoke3(run_dir, m, cfg)
         else:
             raise NotImplementedError(f"phase {a.phase} is not implemented (FULL needs human approval of SMOKE)")
     except BaseException as e:
