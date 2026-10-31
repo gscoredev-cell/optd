@@ -79,7 +79,8 @@ runs/<RUN_ID>/                    local copies (git-ignored except report.md, me
 
 - `kill.ps1 <id>` → `runpodctl pod delete <id>` (volume-attached pods can only be terminated, not stopped). `kill.ps1 --all` deletes every pod named `optd-*`. Run `--all` at session start and end.
 - `watchdog.ps1`: `runpodctl pod list -o json`; for each pod whose name matches `optd-.*-d(\d+)$`, delete it if `now ≥ deadline` or if `now ≥ created + 24h` (malformed name). Also delete any `optd-*` pod whose `runs/<RUN_ID>/status.json` on S3 says DONE/FAILED for more than 15 min. Logs to `orchestrator/watchdog.log`. Needs `RUNPOD_API_KEY` from the user environment and the `runpod` aws profile; no Claude session involved.
-- `register_watchdog.ps1` (human runs once): `Register-ScheduledTask -TaskName OptD-RunPod-Watchdog` with a 15-minute repeating trigger running `pwsh -ExecutionPolicy Bypass -File <abs path>\watchdog.ps1`, run whether the user is logged on or not is **not** required (user session is fine); prints the task it created.
+- `launch.ps1` refuses to create a pod while `OptD-RunPod-Watchdog` is missing or disabled.
+- `register_watchdog.ps1` (human runs once): `Register-ScheduledTask -TaskName OptD-RunPod-Watchdog` with a 15-minute repeating trigger running `conhost.exe --headless pwsh -WindowStyle Hidden -ExecutionPolicy Bypass -File <abs path>\watchdog.ps1` (headless: no console flash), run whether the user is logged on or not is **not** required (user session is fine); prints the task it created.
 
 ### 4.5 Cost guard
 
@@ -91,12 +92,12 @@ Secure Cloud $/h from `runpodctl gpu list` on 2026-10-30: RTX PRO 4500 Blackwell
 0  /start.sh &                      # keep the image's sshd + key setup alive
    set -euo pipefail; R=/workspace/runs/$RUN_ID; mkdir -p $R
    deadline watchdog (background, first thing, uses the pod-scoped RUNPOD_API_KEY and the preinstalled runpodctl):
-      while [ $(date +%s) -lt $DEADLINE_EPOCH ]; do sleep 60; done; runpodctl pod delete $RUNPOD_POD_ID
+      while [ $(date +%s) -lt $DEADLINE_EPOCH ]; do sleep 60; done; self-terminate (same command chain as step 1)
       (DEADLINE_EPOCH is absolute, so a container restart does not reset the clock)
    if status.json exists with state DONE|FAILED: retry self-terminate 5×; sleep infinity   # restart-loop guard
 1  heartbeat loop (background): every 5 min write status.json atomically (tmp + mv)
    trap EXIT: write final status (DONE if rc==0 else FAILED, first error line); sync; self-terminate:
-      runpodctl pod delete $RUNPOD_POD_ID  ||  curl -X DELETE https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID -H "Authorization: Bearer $RUNPOD_API_KEY"
+      runpodctl remove pod $RUNPOD_POD_ID  ||  runpodctl pod delete $RUNPOD_POD_ID  ||  curl -X DELETE https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID -H "Authorization: Bearer $RUNPOD_API_KEY"
       (pod-scoped key injected by RunPod); retry 5× with 30 s sleep; then sleep infinity (terminate-after ends it)
 2  GPU: nvidia-smi name,memory.total → GPU_TIER = largest tier ≤ VRAM (§6) unless GPU_TIER_OVERRIDE; write env.json
 3  code to container disk, never the volume: mkdir /root/repo && cd /root/repo && git init && git remote add origin $GIT_REPO

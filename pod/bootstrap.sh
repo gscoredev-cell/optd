@@ -12,9 +12,9 @@ write_status() {   # state step msg   (atomic: tmp + mv)
 mask() { sed -u -e "s|${HF_TOKEN:-@none@}|***|g" -e "s|${RUNPOD_API_KEY:-@none@}|***|g" -e "s|${GIT_READ_TOKEN:-@none@}|***|g"; }
 terminate() {   # pod-scoped RUNPOD_API_KEY injected by RunPod
   for _ in 1 2 3 4 5; do
-    { runpodctl pod delete "$RUNPOD_POD_ID" || runpodctl remove pod "$RUNPOD_POD_ID" \
+    { runpodctl remove pod "$RUNPOD_POD_ID" || runpodctl pod delete "$RUNPOD_POD_ID" \
       || curl -fsS -X DELETE "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" -H "Authorization: Bearer $RUNPOD_API_KEY"; } \
-      && { echo "== pod delete accepted ($RUNPOD_POD_ID)"; return 0; }   # older runpodctl in the image only has `remove pod`
+      && { echo "== pod delete accepted ($RUNPOD_POD_ID)"; return 0; }   # the image's older runpodctl has only `remove pod`
     sleep 30
   done
   return 1

@@ -8,6 +8,11 @@ param(
 . "$PSScriptRoot/common.ps1"
 Set-Location $Root
 
+# 0. The local watchdog (§4.4) must be registered and enabled: it is the only guard independent of this session.
+$wd = Get-ScheduledTask -TaskName 'OptD-RunPod-Watchdog' -ErrorAction SilentlyContinue
+if (-not $wd) { throw 'scheduled task OptD-RunPod-Watchdog is missing: run orchestrator/register_watchdog.ps1 first' }
+if ($wd.State -eq 'Disabled') { throw 'scheduled task OptD-RunPod-Watchdog is disabled: enable it first' }
+
 # 1. Clean, pushed commit (run artifacts under runs/ do not affect the pod's code).
 if (git status --porcelain -- . ':!runs') { throw 'uncommitted changes: commit and push first' }
 $sha = (git rev-parse HEAD).Trim()
