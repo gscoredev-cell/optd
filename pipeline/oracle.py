@@ -84,9 +84,10 @@ def _tsha(t):
 class MCStore:
     """Finished MC values per (trace sha, point) on the volume; one JSON line per value, later lines win."""
 
-    def __init__(self, model_id, root=pathlib.Path("/workspace/gencache")):
+    def __init__(self, model_id, root=pathlib.Path("/workspace/gencache"), k=MC_K):
         root.mkdir(parents=True, exist_ok=True)
-        self.path = root / f"oracle_{model_id.replace('/', '__')}.jsonl"
+        tag = "" if k == MC_K else f"_k{k}"      # MC values depend on the completions per probe
+        self.path = root / f"oracle_{model_id.replace('/', '__')}{tag}.jsonl"
         self.rows = {}
         if self.path.exists():
             for line in self.path.read_text().splitlines():

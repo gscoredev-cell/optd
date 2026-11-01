@@ -138,3 +138,29 @@ def token_logprobs(model, prefixes, conts, bs, adapter_on=False):
             out.append(lp.gather(-1, torch.tensor(c, dtype=torch.long, device=lp.device)[:, None]).squeeze(-1).cpu())
         del logits
     return out
+
+
+@torch.no_grad()
+def split_logprobs(model, prefixes, conts, bs):
+    """log p(cont_t | ...) under the sampling policy of decode(): the prefix KV (all but the last prefix token) is built
+    with the adapter disabled, the last prefix token and the continuation run with the adapter enabled. Equals
+    token_logprobs(adapter_on=True) only while the adapter is zero. [list of float32]"""
+    out = []
+    for i in range(0, len(prefixes), bs):
+        ps, cs = prefixes[i:i + bs], conts[i:i + bs]
+        ids_p, mask_p, pos_p = _left_pad(ps, 0, model.device)
+        with adapter(model, False):
+            cache = model(input_ids=ids_p[:, :-1], attention_mask=mask_p[:, :-1], position_ids=pos_p[:, :-1],
+                          use_cache=True, logits_to_keep=1).past_key_values
+        T = max(len(c) for c in cs)
+        inp = torch.tensor([[p[-1]] + c[:-1] + [0] * (T - len(c)) for p, c in zip(ps, cs)], device=model.device)
+        valid = torch.tensor([[1] * len(c) + [0] * (T - len(c)) for c in cs], device=model.device)
+        pos = pos_p[:, -1:] + torch.arange(T, device=model.device)[None]
+        with adapter(model, True):
+            logits = model(input_ids=inp, attention_mask=torch.cat([mask_p[:, :-1], valid], 1), position_ids=pos,
+                           past_key_values=cache).logits
+        for r, c in enumerate(cs):
+            lp = logits[r, :len(c)].float().log_softmax(-1)
+            out.append(lp.gather(-1, torch.tensor(c, dtype=torch.long, device=lp.device)[:, None]).squeeze(-1).cpu())
+        del logits, cache
+    return out

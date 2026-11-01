@@ -170,12 +170,13 @@ def main():
                 run_stage(run_dir, name, lambda d, fn=fn: fn(ctx, d), m)
             write_status(run_dir, "report")
             report.smoke(run_dir, m, cfg)
-        elif a.phase == "SMOKE6":
+        elif a.phase in ("SMOKE6", "SMOKE7"):
             import option_e
             import smoke
-            c6 = option_e.Ctx6(cfg, tiers, a.tier, a.run_id, run_dir)
+            c6 = option_e.Ctx6(cfg, tiers, a.tier, a.run_id, run_dir, option_e.VARIANTS[a.phase])
             c6.metrics = m
-            for name, fn in option_e.STAGES:   # E-S3 (validation) runs last and is optional; a failure never costs the report
+            m["variant"] = {k: v for k, v in c6.v.items() if k not in ("budget", "start")}
+            for name, fn in (option_e.STAGES7 if a.phase == "SMOKE7" else option_e.STAGES):   # E-S3 (validation) runs last and is optional; a failure never costs the report
                 try:
                     run_stage(run_dir, name, lambda d, fn=fn: fn(c6, d), m)
                 except Exception as e:

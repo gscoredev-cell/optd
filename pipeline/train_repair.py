@@ -42,7 +42,7 @@ def set_lora(model, state):
     assert not bad, f"adapter state did not match the model: {len(bad)} unexpected keys"
 
 
-def _loss(model, ex, loss_kind, n_tokens):
+def _loss(model, ex, loss_kind, n_tokens, clip_eps=None):
     import torch
     from generate import _left_pad, adapter
     dev = model.device
@@ -62,15 +62,21 @@ def _loss(model, ex, loss_kind, n_tokens):
     lp = logits.log_softmax(-1).gather(-1, tgt[..., None]).squeeze(-1)
     if loss_kind == "rkl":
         pad = lambda key: torch.stack([torch.nn.functional.pad(e[key], (0, T - len(e[key]))) for e in ex]).to(dev)
-        w = (-(pad("lp_s") - pad("lp_t"))).clamp(-5, 5)
-    else:
-        w = torch.ones_like(lp)
-    return -(w * lp * valid).sum() / n_tokens
+        adv = (-(pad("lp_s") - pad("lp_t"))).clamp(-5, 5)
+        if clip_eps:                        # PPO-style: ratio against the stored sampling log-probs
+            ratio = (lp - pad("lp_s")).exp()
+            obj = torch.minimum(ratio * adv, ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv)
+            return -(obj * valid).sum() / n_tokens
+        return -(adv * lp * valid).sum() / n_tokens
+    return -(lp * valid).sum() / n_tokens
 
 
 def _evaluate(model, eval_fn, step, early):
+    import time
     model.eval()
+    t0 = time.time()
     score = eval_fn(model)
+    early["eval_sec"] = early.get("eval_sec", 0.0) + time.time() - t0
     model.train()
     early.setdefault("curve", []).append([step, score])
     if early.get("best_score") is None or score > early["best_score"]:
@@ -81,7 +87,7 @@ def _evaluate(model, eval_fn, step, early):
 
 
 def train(model, data, ckpt_dir, run_id, loss_kind="rkl", resume=False, stop_at=None, ckpt_every=10, micro=4,
-          eff=16, lr=1e-4, eval_fn=None, eval_every=10, patience=3, early=None):
+          eff=16, lr=1e-4, eval_fn=None, eval_every=10, patience=3, early=None, clip_eps=None, deadline=None):
     """One epoch over data (dicts prefix, cont, lp_t, lp_s). Returns ({step: loss}, total optimizer steps)."""
     import torch
     from transformers import get_cosine_schedule_with_warmup
@@ -108,15 +114,20 @@ def train(model, data, ckpt_dir, run_id, loss_kind="rkl", resume=False, stop_at=
         _evaluate(model, eval_fn, 0, early)
     stopped = False
     step = start
+    import time
     for step in range(start, steps):
         if stop_at is not None and step >= stop_at:
             break
+        if deadline is not None and time.time() > deadline:
+            early["cut"] = True
+            break
         idx = order[step * eff:(step + 1) * eff]
         n_tokens = sum(len(data[i]["cont"]) for i in idx)
+        torch.manual_seed(seed_for(run_id, "step", step))   # dev-eval generation between steps must not move the RNG
         opt.zero_grad(set_to_none=True)
         total = 0.0
         for j in range(0, len(idx), micro):
-            loss = _loss(model, [data[i] for i in idx[j:j + micro]], loss_kind, n_tokens)
+            loss = _loss(model, [data[i] for i in idx[j:j + micro]], loss_kind, n_tokens, clip_eps)
             loss.backward()
             total += loss.item()
         opt.step()

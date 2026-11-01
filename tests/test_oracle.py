@@ -152,3 +152,17 @@ def test_interaction_and_cluster_bootstrap():
     assert ci[0] <= point <= ci[1] and ci[0] > 0
     point, ci = O.cluster_bootstrap(rows, lambda rs: O.delta(rs, "E2", "E1"), groups, n=200)
     assert point == 0 and ci == [0.0, 0.0]
+
+
+def test_store_keyed_by_k(tmp_path):
+    t = _trace(0, 2)
+    O.MCStore("m", root=tmp_path, k=3).put([(t, 0, 1.0)])
+    assert O.MCStore("m", root=tmp_path, k=4).get(t, 0) is None       # k = 4 values live in their own file
+    assert O.MCStore("m", root=tmp_path).get(t, 0) == 1.0
+    assert O.oracle_cut([0.25, 0.25, 0.0], thresh=0.25) == 1 and O.oracle_cut([0.25, 0.25, 0.0], thresh=0.5) == 0
+
+
+def test_bisection_with_k4_threshold():
+    mc = [0.75, 0.5, 0.25, 0.0, 0.0]
+    b, probed = O.bisect(lambda j: mc[j], 4, thresh=0.25)
+    assert b == O.oracle_cut(mc, 0.25) == 2 and len(probed) <= 4

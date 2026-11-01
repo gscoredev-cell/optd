@@ -553,10 +553,10 @@ def smoke(run_dir, m, cfg):
     _write(run_dir, lines, m)
 
 
-# ---- Option E (OPTION_E_SPEC.md §8) --------------------------------------------------------------------------------
+# ---- Option E (OPTION_E_SPEC.md §8; SMOKE-7 addendum: per adapter and per regime) -----------------------------------
 
 E_ARMS = ("E0", "E1", "E2", "E3", "E4a", "E4b", "E6")
-E_SETS = ("p1", "p2", "main", "pooled")
+E_SETS = ("p1", "p2", "main", "rc3", "pooled")
 
 
 def _oracle_line(m, tag):
@@ -579,52 +579,122 @@ def _delta(st, key):
 
 
 def e_projection(m, price):
-    """FULL-E per seed (§6 FULL-E) from SMOKE-6 rates: ~1,800 contested train problems, 4 rounds, test = all contested
-    test p1/p2 (~1,950 problems at the SMOKE-4 rates) + RC3 300, 2 continuations per arm. Returns (hours, parts)."""
+    """FULL-E per seed (§6 FULL-E) from the measured rates: ~1,800 contested train problems, 4 rounds, test = all
+    contested test p1/p2 (~1,950 problems at the SMOKE-4 rates) + RC3 300, 2 continuations per arm. Training uses the
+    pure steps/s (dev evaluation and resampling excluded). Returns (hours, parts)."""
     T = 250.0
     mc_rate = m.get("es2_mc_tok_per_s") or m.get("es6_mc_tok_per_s") or 300.0
     gen = m.get("es7_gen_tok_per_s") or m.get("es4_gen_tok_per_s") or 400.0
     prefill = m.get("es4_prefill_tok_per_s") or SMOKE1_TEACHER_PREFILL_TOK_PER_S
-    step = 1 / m["train_steps_per_s"] if m.get("train_steps_per_s") else SMOKE1_TRAIN_SEC_PER_STEP
+    sps = m.get("pure_train_steps_per_s") or m.get("train_steps_per_s")
+    step = 1 / sps if sps else SMOKE1_TRAIN_SEC_PER_STEP
     wrong_rate = ((m.get("es2_greedy_wrong") or 0) / max(m.get("es2_greedy") or 1, 1)) or 0.5
     probes = m.get("es2_probes_per_trace") or 5.0
+    k = (m.get("variant") or {}).get("k", 3)
     n_train_units = 1800 * wrong_rate * 1.5      # greedy wrong + sampled wrong with own scans
     n_test = 1950 * wrong_rate + 300 * wrong_rate
+    n_arms = 3 + 5 * len((m.get("variant") or {}).get("adapters", ("rkl",)))
     parts = {
-        "oracle_train": n_train_units * probes * 3 * T / mc_rate,
+        "oracle_train": n_train_units * probes * k * T / mc_rate,
         "continuations_4_rounds": 4 * n_train_units * 5 * T / gen,
         "teacher_scoring": 4 * n_train_units * 5 * (2 * T + 150) / prefill,
-        "training": 4 * n_train_units * 5 / 16 * step + 4 * 10 * 60,
-        "oracle_test": n_test * probes * 3 * T / mc_rate,
-        "arms": n_test * 7 * 2 * T / gen + 0.5 * n_test * 2 * 2 * T / gen,
+        "training": 4 * n_train_units * 5 / 16 * step,
+        "dev_evals": 4 * 5 * (m.get("rkl_dev_eval_sec") or m.get("dev_eval_sec") or 60.0),
+        "oracle_test": n_test * probes * k * T / mc_rate,
+        "arms": n_test * n_arms * 2 * T / gen,
     }
-    parts = {k: v / 3600 for k, v in parts.items()}
+    parts = {k2: v / 3600 for k2, v in parts.items()}
     return sum(parts.values()), parts
+
+
+def _arms_block(m, ad, label):
+    """ARMS + DELTAS lines for one adapter: regimes all / pointed (b* >= 1) / restart (b* = 0), per set and pooled."""
+    lines = [f"ARMS [{label}] (test; recovery rate wrong -> correct; new tokens incl. injected text; truncation):"]
+    for reg in ("all", "pointed", "restart"):
+        for s in E_SETS:
+            st = m.get(f"es7_{ad}_{reg}_{s}")
+            if not st or not st["n"]:
+                continue
+            lines.append(f"  {reg} {s} (n {st['n']}, problems {st['problems']}): " + " ; ".join(
+                f"{a} {_p(st.get(f'rec_{a}'))} ({_n(st.get(f'tokens_{a}'), 0)} tok, trunc {_p(st.get(f'trunc_{a}'))})"
+                for a in E_ARMS))
+    lines.append(f"  E5 harm [{label}] (correct -> wrong, adapter on, random cut) {_p(m.get(f'es7_e5_harm_{ad}'))} vs "
+                 f"plain-retry harm {_p(m.get('es7_plain_harm'))} (n {m.get('es7_e5_n')})")
+    lines.append(f"DELTAS [{label}] (points; 95% CI by cluster bootstrap on original_id, 10,000 resamples; I on pointed "
+                 "units is primary):")
+    for reg in ("pointed", "restart", "all"):
+        for s in E_SETS:
+            st = m.get(f"es7_{ad}_{reg}_{s}")
+            if st and "delta_primary" in st:
+                lines.append(f"  {reg} {s} (n {st['n']}): delta_primary E3-E1 {_delta(st, 'delta_primary')} | E2-E1 "
+                             f"{_delta(st, 'e2_minus_e1')} | E3-E2 {_delta(st, 'e3_minus_e2')} | I {_delta(st, 'interaction')}")
+    return lines
+
+
+def _train_block(m, ad, label):
+    pre = f"{ad}_"
+    if f"{pre}train_rounds" not in m:
+        return [f"TRAIN [{label}]: {m.get(f'{ad}_skipped') or m.get(f'{pre}train_blocker', 'not run')}"]
+    lines = [
+        f"TRAIN [{label}]: rounds {m.get(f'{pre}train_rounds_done')} | steps {m.get(f'{pre}train_steps_total')} | best: round "
+        f"{m.get(f'{pre}train_best_round')} step {m.get(f'{pre}train_best_step')} dev E3 recovery {_p(m.get(f'{pre}train_best_dev'))} | "
+        f"early stopping fired {'y' if m.get(f'{pre}early_stop_fired') else 'n'} | train {_n(m.get(f'{pre}train_sec'), 0)} s "
+        f"(dev evals {_n(m.get(f'{pre}dev_eval_sec'), 0)} s, resampling {_n(m.get(f'{pre}resample_sec'), 0)} s) | steps/s "
+        f"{_n(m.get(f'{pre}train_steps_per_s'), 4)} overall, {_n(m.get(f'{pre}pure_train_steps_per_s'), 4)} pure"
+        + (f" | {m[f'{pre}rounds_stopped']}" if m.get(f"{pre}rounds_stopped") else "")
+        + (f" | {m[f'{pre}train_blocker']}" if m.get(f"{pre}train_blocker") else "")]
+    for r in m.get(f"{pre}train_rounds") or []:
+        curve = " ; ".join(f"{s}: {_p(v)}" for s, v in r["curve"])
+        n_ex = m.get(f"{pre}train_examples_r{r['round']}")
+        lines.append(f"  round {r['round']}: steps {r['steps']} (examples {n_ex}) | "
+                     f"loss start/end {_n(r['loss_start'], 4)}/{_n(r['loss_end'], 4)} | dev E3 recovery per eval (step: rate) "
+                     f"{curve or 'n/a'} | best step {r['best_step']} | stopped early {'y' if r['stopped'] else 'n'}")
+    for r in range(2, 5):
+        if m.get(f"{pre}round{r}_skipped"):
+            lines.append(f"  round {r}: {m[f'{pre}round{r}_skipped']}")
+    return lines
 
 
 def option_e(run_dir, m, cfg):
     env, _, lines = header(run_dir, m, cfg)
     price = m["price_per_hr"]
-    stages = ("ES1", "ES2", "ES4", "ES5", "ES6", "ES7", "ES8", "ES3")
+    v = m.get("variant") or {"k": 3, "thresh": 0.5, "lr": 1e-4, "clip": None, "dev_n": 60, "rounds": 2, "adapters": ["rkl"],
+                             "extra_data": False}
+    adapters = [a for a in v["adapters"]]
+    stages = (("ES0",) if v.get("extra_data") else ()) + ("ES1", "ES2", "ES4", "ES5", "ES6", "ES7", "ES8", "ES3")
     skipped = {s: m.get(f"{s}_skipped") for s in stages if m.get(f"{s}_skipped")}
     hm = " ; ".join(f"{k[:-11]} {m[k]}/{m[k[:-4] + 'misses']}" for k in sorted(m) if k.endswith("_cache_hits"))
     c_tr, c_te = m.get("es1_contested_train") or {}, m.get("es1_contested_test") or {}
     lines += [
-        "METHOD: oracle pointer (MC >= 0.5, 3 completions, bisection) -> LoRA repair adapter (rkl, early stopping on 60 "
-        "dev traces, 2 rounds) ; first attempts greedy via the cache ; arms E0-E6 + E5 ; A6 not run (optional in SMOKE-6)",
+        f"METHOD: oracle pointer (MC >= {v['thresh']}, {v['k']} completions per probe, bisection) -> LoRA repair adapter(s) "
+        f"{'/'.join(adapters)} (lr {v['lr']}, PPO clip {v['clip']}, early stopping on {v['dev_n']} dev traces, up to "
+        f"{v['rounds']} rounds) ; first attempts greedy via the cache ; arms E0-E6 + E5 per adapter ; A6 not run",
         "TIMING (min): " + " | ".join(f"{s} {m.get(f'{s}_min')}" for s in stages) + f" | total {m['elapsed_min']:.2f}",
         f"CACHE: SMOKE-4 A1 traces imported {m.get('es1_a1_imported')}/{m.get('es1_a1_traces')} | A3 scans imported as MC "
-        f"vectors {m.get('es1_a3_scans')} ({m.get('es1_a3_points_new')} new points; completions were not stored by SMOKE-4) "
-        f"| hits/misses per stage: {hm or 'n/a'}",
-        f"DATA: contested train problems p1/p2/main {c_tr.get('p1')}/{c_tr.get('p2')}/{c_tr.get('main')} "
-        f"(RC3 none in SMOKE-6) | contested test p1/p2 {c_te.get('p1')}/{c_te.get('p2')} | wrong greedy train traces "
+        f"vectors {m.get('es1_a3_scans')} ({m.get('es1_a3_points_new')} new points; k = 3 store only) | hits/misses per "
+        f"stage: {hm or 'n/a'}",
+    ]
+    if v.get("extra_data"):
+        if "ES0_skipped" in m:
+            lines.append(f"DATA (E-S0): {m['ES0_skipped']}")
+        else:
+            lines.append(f"DATA (E-S0, 4 samples per extra problem, T 0.8, cap 800): problems {m.get('es0_problems')}/"
+                         f"{m.get('es0_of')} | tok/s {_n(m.get('es0_tok_per_s'), 1)} (batch {m.get('es0_bs')}) | truncation "
+                         f"{_p(m.get('es0_trunc'))} | mean tokens {_n(m.get('es0_mean_tokens'), 1)}")
+            for k in sorted(k for k in m if k.startswith("es0_t") and isinstance(m[k], dict)):
+                d = m[k]
+                lines.append(f"  {k[4:]}: problems {d['problems']}/{d['of']} | #correct of 4 (0..4) {d['hist']} | accuracy "
+                             f"{_p(d['acc'])} | contested {_p(d['contested'])}")
+    lines += [
+        f"DATA: contested train problems p1/p2/main/rc3 {c_tr.get('p1')}/{c_tr.get('p2')}/{c_tr.get('main')}/{c_tr.get('rc3')} "
+        f"| contested test p1/p2 {c_te.get('p1')}/{c_te.get('p2')} | wrong greedy train traces "
         f"{m.get('es2_greedy_wrong')} of {m.get('es2_greedy')} (acc {_p(m.get('es2_greedy_acc'))}) | wrong greedy test "
         f"traces {m.get('es6_greedy_wrong')} of {m.get('es6_greedy')} (acc {_p(m.get('es6_greedy_acc'))}) | correct test "
         f"traces for E5 {m.get('es6_e5_traces')} (of {m.get('es6_correct_greedy')})",
         f"ORACLE (train): bisection probes per trace {_n(m.get('es2_probes_per_trace'), 2)} (rounds "
         f"{m.get('es2_bisect_rounds')}; traces {m.get('es2_bisect_traces')}/{m.get('es2_bisect_of')}) | units "
         f"{m.get('es2_units')} = bisected + A3 own scans {m.get('es2_units_a3')} + sampled reusing the greedy cut "
-        f"{m.get('es2_units_reuse')} | units with b* >= 1: {m.get('es2_units_b_ge1')} | MC tok/s "
+        f"{m.get('es2_units_reuse')} | POINTED train units (b* >= 1): {m.get('es2_units_b_ge1')} | MC tok/s "
         f"{_n(m.get('es2_mc_tok_per_s'), 1)}",
         *[f"  train {x}" for x in _oracle_line(m, "es2_oracle")],
         f"ORACLE (test): probes per trace {_n(m.get('es6_probes_per_trace'), 2)} | traces {m.get('es6_bisect_traces')}/"
@@ -640,82 +710,63 @@ def option_e(run_dir, m, cfg):
         lines.append(f"TRAIN DATA: {m['ES4_skipped']}")
     else:
         lines.append(
-            f"TRAIN DATA (round 1): units {m.get('es4_units')} (sloppy b*-1 copies {m.get('es4_sloppy_units')}) | dev traces "
-            f"{m.get('es4_dev_traces')} (b* >= 1: {m.get('es4_dev_b_ge1')}) | continuations {m.get('es4_continuations')} "
-            f"(primary {_p(m.get('es4_cont_primary'))}, truncation {_p(m.get('es4_cont_trunc'))}) | teacher-also-wrong "
-            f"{_p(m.get('es4_teacher_also_wrong'))} (n {m.get('es4_teacher_scored')}) | mean advantage "
-            f"{_n(m.get('es4_mean_adv'))}")
+            f"TRAIN DATA (round 1): units {m.get('es4_units')} (pointed {m.get('es4_train_units_b_ge1')}, sloppy b*-1 copies "
+            f"{m.get('es4_sloppy_units')}) | dev traces {m.get('es4_dev_traces')} (b* >= 1: {m.get('es4_dev_b_ge1')}) | "
+            f"continuations {m.get('es4_continuations')} (primary {_p(m.get('es4_cont_primary'))}, truncation "
+            f"{_p(m.get('es4_cont_trunc'))}) | teacher-also-wrong {_p(m.get('es4_teacher_also_wrong'))} (n "
+            f"{m.get('es4_teacher_scored')}) | mean advantage {_n(m.get('es4_mean_adv'))}")
     if "ES5_skipped" in m:
         lines.append(f"TRAIN: {m['ES5_skipped']}")
     else:
-        rounds = m.get("train_rounds") or []
-        lines.append(
-            f"TRAIN: rkl | rounds {m.get('train_rounds_done')} | steps {m.get('train_steps_total')} | best: round "
-            f"{m.get('train_best_round')} step {m.get('train_best_step')} dev E3 recovery {_p(m.get('train_best_dev'))} | "
-            f"early stopping fired {'y' if m.get('early_stop_fired') else 'n'} | resume check "
-            f"{'y' if m.get('resume_ok') else 'n' if m.get('resume_ok') is False else 'n/a'} (kill at "
-            f"{m.get('train_kill_at')}, ckpt every {m.get('train_ckpt_every')}, max rel diff "
-            f"{_n(m.get('resume_max_rel_diff'), 6)}) | adapter params {m.get('adapter_params')} | train steps/s "
-            f"{_n(m.get('train_steps_per_s'), 4)}" + (f" | {m['train_blocker']}" if m.get("train_blocker") else ""))
-        for r in rounds:
-            curve = " ; ".join(f"{s}: {_p(v)}" for s, v in r["curve"])
-            lines.append(f"  round {r['round']}: steps {r['steps']} | loss start/end {_n(r['loss_start'], 4)}/"
-                         f"{_n(r['loss_end'], 4)} | dev E3 recovery per eval (step: rate) {curve or 'n/a'} | best step "
-                         f"{r['best_step']} | stopped early {'y' if r['stopped'] else 'n'}")
-        if m.get("round2_skipped"):
-            lines.append(f"  round 2: {m['round2_skipped']}")
+        lines.append(f"TRAIN: resume check {'y' if m.get('resume_ok') else 'n' if m.get('resume_ok') is False else 'n/a'}"
+                     f"{' (exact)' if m.get('resume_exact') else ''} (kill at {m.get('train_kill_at')}, ckpt every "
+                     f"{m.get('train_ckpt_every')}, max rel diff {_n(m.get('resume_max_rel_diff'), 6)}) | adapter params "
+                     f"{m.get('adapter_params')} | round-1 examples {m.get('train_examples_r1')}"
+                     + (f" | {m['train_blocker']}" if m.get("train_blocker") else ""))
+        for ad in adapters:
+            lines += _train_block(m, ad, ad)
     if "ES7_skipped" in m:
         lines.append(f"ARMS: {m['ES7_skipped']}")
     else:
         lines.append(
             f"IDENTITY: untrained E3 == E1 {m.get('identity_equal')}/{m.get('identity_n')} (max token diff "
-            f"{m.get('identity_max_token_diff')}) | adapter {'trained' if m.get('es7_adapter_trained') else 'UNTRAINED'} | "
-            f"units {m.get('es7_units')} (restart b* = 0: {m.get('es7_restart_units')}) | E4a/E4b clamped at 0/B "
-            f"{m.get('es7_clamped')} | arms done {m.get('es7_arms_done')}"
+            f"{m.get('identity_max_token_diff')}) | adapters {m.get('es7_adapters')} | units {m.get('es7_units')} "
+            f"(POINTED b* >= 1: {m.get('es7_pointed_units')}, restart b* = 0: {m.get('es7_restart_units')}) | E4a/E4b "
+            f"clamped at 0/B {m.get('es7_clamped')} | arms done {m.get('es7_arms_done')}"
             + (f" | {m['es7_arms_cut']}" if m.get("es7_arms_cut") else ""))
-        lines.append("ARMS (test; recovery rate wrong -> correct; new tokens incl. injected text; truncation):")
-        for s in E_SETS:
-            st = m.get(f"es7_{s}")
-            if not st:
-                continue
-            lines.append(f"  {s} (n {st['n']}, problems {st['problems']}): " + " ; ".join(
-                f"{a} {_p(st.get(f'rec_{a}'))} ({_n(st.get(f'tokens_{a}'), 0)} tok, trunc {_p(st.get(f'trunc_{a}'))})"
-                for a in E_ARMS))
-        lines.append(f"  E5 harm (correct -> wrong, adapter on, random cut) {_p(m.get('es7_e5_harm'))} vs plain-retry "
-                     f"harm {_p(m.get('es7_plain_harm'))} (n {m.get('es7_e5_n')})")
-        lines.append("DELTAS (points; 95% CI by cluster bootstrap on original_id, 10,000 resamples):")
-        for s in E_SETS:
-            st = m.get(f"es7_{s}")
-            if st and "delta_primary" in st:
-                lines.append(f"  {s}: delta_primary E3-E1 {_delta(st, 'delta_primary')} | E2-E1 {_delta(st, 'e2_minus_e1')} "
-                             f"| E3-E2 {_delta(st, 'e3_minus_e2')} | I {_delta(st, 'interaction')}")
+        for ad in m.get("es7_adapters") or []:
+            if f"es7_{ad}_all_pooled" in m:
+                lines += _arms_block(m, ad, ad)
     hours, parts = e_projection(m, price)
-    pooled = m.get("es7_pooled") or {}
+    first = adapters[0] if adapters else "rkl"
+    pooled = m.get(f"es7_{first}_pointed_pooled") or {}
+    verdict = {True: "pass", False: "fail", None: "n/a"}
     gates = {
-        "pipeline (identity 20/20, resume, early stop fired)": None if "ES7_skipped" in m else bool(
-            m.get("identity_n") and m.get("identity_equal") == m.get("identity_n") and m.get("resume_ok")
-            and m.get("early_stop_fired")),
-        "oracle (agreement >= 80%, >= 100 train units with b* >= 1)": None if m.get("es2_units_b_ge1") is None else bool(
-            (m.get("es3_agree") or 0) >= 0.80 and m["es2_units_b_ge1"] >= 100),
-        "signal (soft: delta_primary pooled >= +5 and I >= 0)": None if "delta_primary" not in pooled else bool(
+        "pipeline (identity 20/20, resume, early stop fired)": None if "ES7_skipped" in m or m.get("resume_ok") is None
+        else bool(m.get("identity_n") and m.get("identity_equal") == m.get("identity_n") and m.get("resume_ok")
+                  and any(m.get(f"{a}_early_stop_fired") for a in adapters)),
+        "oracle (agreement >= 80%, >= 100 pointed train units)": None if m.get("es2_units_b_ge1") is None
+        or _bad(m.get("es3_agree")) else bool(m["es3_agree"] >= 0.80 and m["es2_units_b_ge1"] >= 100),
+        f"signal (soft: {first} delta_primary pooled >= +5 and I >= 0 on POINTED test units, n "
+        f"{pooled.get('n')})": None if "delta_primary" not in pooled else bool(
             pooled["delta_primary"] >= 0.05 and pooled["interaction"] >= 0),
-        "harm (E5 <= 1.5 x plain-retry)": None if _bad(m.get("es7_e5_harm")) else bool(
-            m["es7_e5_harm"] <= 1.5 * (m.get("es7_plain_harm") or 0.0)),
+        f"harm ({first} E5 <= 1.5 x plain-retry)": None if _bad(m.get(f"es7_e5_harm_{first}")) or _bad(m.get("es7_plain_harm"))
+        else bool(m[f"es7_e5_harm_{first}"] <= 1.5 * m["es7_plain_harm"]),
         "timing (FULL-E <= 12 h per seed)": hours <= 12,
     }
-    verdict = {True: "pass", False: "fail", None: "n/a"}
-    blockers = [f"{s} {v}" for s, v in skipped.items()]
-    if "ES7" not in skipped and "delta_primary" in pooled and pooled["delta_primary"] <= -0.05:
-        blockers.append("delta_primary pooled <= -5 points: stop")
+    blockers = [f"{s} {v2}" for s, v2 in skipped.items()]
+    if "delta_primary" in pooled and pooled["delta_primary"] <= -0.05:
+        blockers.append("delta_primary on pointed units <= -5 points: stop")
     if m.get("es7_adapter_trained") is False:
-        blockers.append("adapter untrained in E-S7")
+        blockers.append("no trained adapter in E-S7")
     lines += [
-        f"THROUGHPUT: gen tok/s {_n(m.get('es7_gen_tok_per_s') or m.get('es4_gen_tok_per_s'), 1)} | MC tok/s "
-        f"{_n(m.get('es2_mc_tok_per_s'), 1)} | teacher prefill tok/s {_n(m.get('es4_prefill_tok_per_s'), 1)} | train "
-        f"steps/s {_n(m.get('train_steps_per_s'), 4)}",
-        f"PROJECTION: FULL-E {hours:.1f} h and ${hours * price:.2f} per seed on this tier (rough; "
-        + ", ".join(f"{k} {v:.1f} h" for k, v in parts.items()) + "; cut train size, then rounds, then seeds if > 12 h)",
-        "GATES: " + " ; ".join(f"{k} {verdict[v]}" for k, v in gates.items()),
+        f"THROUGHPUT: gen tok/s {_n(m.get('es7_gen_tok_per_s') or m.get('es4_gen_tok_per_s'), 1)} | data tok/s "
+        f"{_n(m.get('es0_tok_per_s'), 1)} | MC tok/s {_n(m.get('es2_mc_tok_per_s'), 1)} | teacher prefill tok/s "
+        f"{_n(m.get('es4_prefill_tok_per_s'), 1)} | train steps/s pure {_n(m.get('pure_train_steps_per_s'), 4)} "
+        f"(overall {_n(m.get('train_steps_per_s'), 4)})",
+        f"PROJECTION: FULL-E {hours:.1f} h and ${hours * price:.2f} per seed on this tier (rough, pure training steps/s; "
+        + ", ".join(f"{k} {v2:.1f} h" for k, v2 in parts.items()) + "; cut train size, then rounds, then seeds if > 12 h)",
+        "GATES: " + " ; ".join(f"{k} {verdict[v2]}" for k, v2 in gates.items()),
         f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} "
         f"<= ${cfg['phase_budget_usd'][env['phase']]}",
         "BLOCKERS: " + ("; ".join(blockers) if blockers else "none"),

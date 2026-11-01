@@ -148,3 +148,13 @@ Read, in order: `CLAUDE.md`, this file, `OPTION_D_SPEC.md` §1–§6 and §13–
 - With ≈ 200 training units the adapter may learn little in SMOKE-6; the soft gate reflects that. FULL-E is where the test happens.
 - Restart share near 50% on p2 (SMOKE-4) means half the test units have `b* = 0`; p1 (lower restart share expected) is the more informative set. Report both.
 - Teacher log-probs on student continuations from an oracle prefix are off-distribution for the teacher only mildly (the prefix is the student's own correct-so-far text); still count teacher-also-wrong units.
+
+## 12. SMOKE-7 addendum (2026-10-31, after SMOKE-6)
+
+SMOKE-6 findings: the adapter learns after ~10 steps (E3 66%, E6 59% vs E0 33%); the E2 hint adds +15; round 2 over-optimizes; the pointer regime is starved (restart share 78–80% at MC ≥ 0.5); the projection was inflated by dev evaluations. SMOKE-7 (phase `SMOKE7`; A100 first, else L40; cap 120 min; budget $4):
+
+1. **Oracle:** 4 completions per probe; recoverable = at least 1 of 4 correct (MC ≥ 0.25); bisection; re-validate on 20 traces with full scans; restart share per set. The MC store is keyed by k (`oracle_<model>_k4.jsonl`); A3's k = 3 scans are not reused as units.
+2. **Data (E-S0):** 4 samples for 800 additional train problems (p1 400, p2 200, RC3 200 at seed 703; train templates, disjoint from SMOKE-4's) and 500 additional test problems (p1 250, p2 250; test templates), all through the cache; contested = 1..3 of 4. Target ≥ 120 pointed train units (b* ≥ 1); report the count. Caps: 300 train / 200 test traces for bisection.
+3. **Training:** lr 5e-5; PPO-style ratio clipping (ε 0.2) on `rkl` against the stored sampling log-probs; a second adapter trained with `rft` on the same units (ablation); dev evaluation every 10 steps on 30 fixed-seed traces (pointed traces first); up to 3 rounds; early stopping across rounds keeps the best checkpoint and stops once a round fails to improve dev; the RNG is seeded before each optimizer step so the resume check is exact; training and dev-eval time reported separately.
+4. **Arms:** §3 with both adapters (E3/E4a/E4b/E6 and E5 for `rkl` and for `rft`; E0/E1/E2 shared). One continuation per arm, identical batches and seeds.
+5. **Analysis:** every delta on pointed units (b* ≥ 1) and on restart units (b* = 0) separately, with n and cluster-bootstrap CIs; `I` on pointed units is primary. Projection from pure training steps/s. Gates per §7 with the pointed-unit counts.
