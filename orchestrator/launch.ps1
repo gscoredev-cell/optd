@@ -2,7 +2,7 @@
 # Success = runs/<RUN_ID>/status.json appears on the volume within 10 min of creation. SSH is debugging-only: no --wait,
 # ip/port are recorded when pod get shows them, never required. Exit 0 ok, 2 FAILED: no heartbeat, 3 NO_CAPACITY.
 param(
-    [Parameter(Mandatory)][ValidateSet('WATCHDOGTEST', 'ENVCHECK', 'SMOKE', 'SMOKE3', 'SMOKE4', 'SMOKE5', 'SMOKE6', 'SMOKE7', 'SMOKE8', 'FULL')][string]$Phase,
+    [Parameter(Mandatory)][ValidateSet('WATCHDOGTEST', 'ENVCHECK', 'SMOKE', 'SMOKE3', 'SMOKE4', 'SMOKE5', 'SMOKE6', 'SMOKE7', 'SMOKE8', 'SMOKE9', 'FULL')][string]$Phase,
     [int]$Seed = 0, [int]$MaxMinutes = 0, [long]$DeadlineEpoch = 0
 )
 . "$PSScriptRoot/common.ps1"

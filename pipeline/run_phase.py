@@ -156,7 +156,7 @@ def main():
     try:
         m = {"pipeline_start": time.time()}
         run_stage(run_dir, "env", stage_env, m)
-        if a.phase != "SMOKE8":            # SMOKE-8 checks its own two prompt variants in Z0 (other tokenizers)
+        if a.phase not in ("SMOKE8", "SMOKE9"):   # Qwen3.5 phases check their own prompt variants (other tokenizers)
             run_stage(run_dir, "templates", lambda d: stage_templates(d, cfg), m)
         if a.phase == "ENVCHECK":
             run_stage(run_dir, "gen", lambda d: stage_gen(d, cfg, tiers, a.tier), m)
@@ -186,11 +186,17 @@ def main():
                     smoke.free()
             write_status(run_dir, "report")
             report.option_e(run_dir, m, cfg)
-        elif a.phase == "SMOKE8":
+        elif a.phase in ("SMOKE8", "SMOKE9"):
             import smoke8
-            c8 = smoke8.Ctx8(cfg, tiers, a.tier, a.run_id, run_dir)
+            if a.phase == "SMOKE9":
+                import smoke9
+                c8 = smoke9.Ctx9(cfg, tiers, a.tier, a.run_id, run_dir)
+                stages, final = smoke9.STAGES, lambda: report.smoke9(run_dir, m, cfg, c8.src_metrics)
+            else:
+                c8 = smoke8.Ctx8(cfg, tiers, a.tier, a.run_id, run_dir)
+                stages, final = smoke8.STAGES, lambda: report.smoke8(run_dir, m, cfg)
             c8.metrics = m
-            for name, fn in smoke8.STAGES:
+            for name, fn in stages:
                 try:
                     run_stage(run_dir, name, lambda d, fn=fn: fn(c8, d), m)
                 except Exception as e:
@@ -200,7 +206,7 @@ def main():
                     gc.collect()
                     torch.cuda.empty_cache()
             write_status(run_dir, "report")
-            report.smoke8(run_dir, m, cfg)
+            final()
         elif a.phase in ("SMOKE3", "SMOKE4", "SMOKE5"):
             import importlib
             import smoke

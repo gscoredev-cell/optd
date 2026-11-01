@@ -91,8 +91,13 @@ def _loss_plain(model, ex, loss_kind, n_tokens, clip_eps=None):
         lr = logits[r, start:start + len(c)].float().log_softmax(-1)
         lp[r, :len(c)] = lr.gather(-1, torch.tensor(c, dtype=torch.long, device=dev)[:, None]).squeeze(-1)
     valid = torch.tensor([[1] * len(e["cont"]) + [0] * (T - len(e["cont"])) for e in ex], device=dev)
+    pad = lambda key: torch.stack([torch.nn.functional.pad(e[key], (0, T - len(e[key]))) for e in ex]).to(dev)
+    if loss_kind == "grpo":                 # sequence advantage e["adv"] on every token; PPO clip vs the sampling log-probs
+        adv = torch.tensor([float(e["adv"]) for e in ex], device=dev)[:, None].expand_as(lp)
+        ratio = (lp - pad("lp_s")).exp()
+        obj = torch.minimum(ratio * adv, ratio.clamp(1 - (clip_eps or 0.2), 1 + (clip_eps or 0.2)) * adv)
+        return -(obj * valid).sum() / n_tokens
     if loss_kind == "rkl":
-        pad = lambda key: torch.stack([torch.nn.functional.pad(e[key], (0, T - len(e[key]))) for e in ex]).to(dev)
         adv = (-(pad("lp_s") - pad("lp_t"))).clamp(-5, 5)
         if clip_eps:
             ratio = (lp - pad("lp_s")).exp()

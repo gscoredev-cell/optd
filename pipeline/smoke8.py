@@ -214,11 +214,11 @@ def lora_targets(model):
 # ---- context ---------------------------------------------------------------------------------------------------------
 
 class Ctx8:
-    def __init__(self, cfg, tiers, tier, run_id, run_dir):
+    def __init__(self, cfg, tiers, tier, run_id, run_dir, max_new=MAX_NEW):
         import data as D
         from generate import load_tokenizer, prompt_ids
         from huggingface_hub import snapshot_download
-        self.cfg, self.run_id, self.run_dir, self.tier = cfg, run_id, run_dir, tier
+        self.cfg, self.run_id, self.run_dir, self.tier, self.max_new = cfg, run_id, run_dir, tier, max_new
         self.repo = cfg["smoke8_model"]
         self.gen_bs = {80: 64, 48: 32, 32: 16, 24: 8}[tier]
         self.lp_bs = {80: 16, 48: 8, 32: 4, 24: 4}[tier]
@@ -318,12 +318,12 @@ class Ctx8:
     def gen(self, seqs, seeds, deadline, sample=True, budgets=None):
         """Adapter-off generation through the cache (plain generate)."""
         model = self.model()
-        return cached_decode(self.cache, model, seqs, seeds, self.gen_bs, MAX_NEW, self.eos, self.pad, budgets=budgets,
+        return cached_decode(self.cache, model, seqs, seeds, self.gen_bs, self.max_new, self.eos, self.pad, budgets=budgets,
                              deadline=deadline, sample=sample, decode_fn=gen8)
 
     def gen_adapter(self, seqs, seeds, deadline, sample=True, budgets=None):
         """Adapter-on generation (never cached); seeds[c] per chunk."""
-        return gen8_batches(self.lora(), seqs, self.gen_bs, MAX_NEW, self.eos, self.pad, seed_fn=lambda c: seeds[c],
+        return gen8_batches(self.lora(), seqs, self.gen_bs, self.max_new, self.eos, self.pad, seed_fn=lambda c: seeds[c],
                             budgets=budgets, deadline=deadline, sample=sample, adapter_on=True)
 
     def trace(self, pid, prompt, gen, trunc, k="g"):
@@ -516,7 +516,7 @@ def z3(c8, d):
     tcache = GenCache(c8.repo + "#teacher")
     mk = c8.mark()
     toks, trunc = cached_decode(tcache, c8.model(), [c8.teacher_prompt(u["pid"]) for u in units], [0] * len(units),
-                                c8.gen_bs, MAX_NEW, c8.eos, c8.pad, deadline=deadline, sample=False, decode_fn=gen8)
+                                c8.gen_bs, c8.max_new, c8.eos, c8.pad, deadline=deadline, sample=False, decode_fn=gen8)
     tea = {u["pid"]: c8.ok(u["pid"], tk, tr) for u, tk, tr in zip(units, toks, trunc) if tk is not None}
     c8.save(d, "teacher_ok", tea)
     m = {"z3_teacher_n": len(tea), "z3_teacher_acc": _rate(list(tea.values())),
@@ -578,7 +578,7 @@ def _dev_fn(c8, dev):
     seeds = O.chunk_seeds(c8.run_id, "dev", len(seqs), c8.gen_bs)
 
     def fn(model):
-        toks, trunc = gen8_batches(model, seqs, c8.gen_bs, MAX_NEW, c8.eos, c8.pad, seed_fn=lambda c: seeds[c],
+        toks, trunc = gen8_batches(model, seqs, c8.gen_bs, c8.max_new, c8.eos, c8.pad, seed_fn=lambda c: seeds[c],
                                    sample=True, adapter_on=True)
         return _rate([c8.ok(u["pid"], tk, tr) for u, tk, tr in zip(dev, toks, trunc)])
     return fn
@@ -684,8 +684,8 @@ def z5(c8, d):
             m_cut = f"deadline before {arm}"
             break
         seqs = [t["prompt"] + (c8.hint_ids if hint else []) for t in units]
-        toks, trunc = gen8_batches(model, seqs, c8.gen_bs, MAX_NEW, c8.eos, c8.pad, seed_fn=lambda c: seeds[c],
-                                   budgets=[MAX_NEW - (len(c8.hint_ids) if hint else 0)] * len(seqs), deadline=deadline,
+        toks, trunc = gen8_batches(model, seqs, c8.gen_bs, c8.max_new, c8.eos, c8.pad, seed_fn=lambda c: seeds[c],
+                                   budgets=[c8.max_new - (len(c8.hint_ids) if hint else 0)] * len(seqs), deadline=deadline,
                                    sample=True, adapter_on=on)
         if len(toks) < len(seqs):
             m_cut = f"deadline inside {arm}"
@@ -699,7 +699,7 @@ def z5(c8, d):
     for name, on in (("adapter", True), ("plain", False)):
         if time.time() > deadline or not harm_tr:
             break
-        toks, trunc = gen8_batches(model, [t["prompt"] for t in harm_tr], c8.gen_bs, MAX_NEW, c8.eos, c8.pad,
+        toks, trunc = gen8_batches(model, [t["prompt"] for t in harm_tr], c8.gen_bs, c8.max_new, c8.eos, c8.pad,
                                    seed_fn=lambda c: hseeds[c], deadline=deadline, sample=True, adapter_on=on)
         if len(toks) == len(harm_tr):
             harm[name] = [not c8.ok(t["pid"], tk, tr) for t, tk, tr in zip(harm_tr, toks, trunc)]
@@ -735,7 +735,7 @@ def z6(c8, d):
     trained = c8.has("Z4", "adapter")
     set_lora(model, c8.load("Z4", "adapter") if trained else c8.lora_init())
     t0 = time.time()
-    toks, trunc = gen8_batches(model, [t["prompt"] for t in base], c8.gen_bs, MAX_NEW, c8.eos, c8.pad, deadline=deadline,
+    toks, trunc = gen8_batches(model, [t["prompt"] for t in base], c8.gen_bs, c8.max_new, c8.eos, c8.pad, deadline=deadline,
                                adapter_on=True)
     sec = time.time() - t0
     a6 = [c8.ok(t["pid"], tk, tr) for t, tk, tr in zip(base, toks, trunc)]

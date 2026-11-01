@@ -930,3 +930,165 @@ def smoke8(run_dir, m, cfg):
     ]
     m["smoke8_gates"] = gates
     _write(run_dir, lines, m)
+
+
+# ---- SMOKE-9 (cap 3200 re-evaluation + GRPO; SMOKE-8 numbers at cap 800 side by side) ------------------------------
+
+def _ci9(v, key):
+    ci = v.get(key + "_ci") or [None, None]
+    return f"{_pt(v.get(key))} [{_pt(ci[0])}, {_pt(ci[1])}]"
+
+
+def s9_projection(m, price, m8):
+    """FULL per seed at cap 3200 from the measured rates: 1,500 contested train problems x 4 continuations x 3 rounds
+    (GRPO: no teacher), training at the pure steps/s, dev evals as measured, 600 test units x 2 arms + harm, A6 and base
+    greedy on 1,500 test problems, 4x sampling of 2,100 problems."""
+    T = m.get("y3r2_mean_tokens") or m.get("y2_mean_tokens") or (m8.get("z2_mean_tokens") or 600.0) * 1.5
+    gen = m.get("y3r2_gen_tok_per_s") or m.get("rkl_a6_tok_per_s") or m.get("y2_tok_per_s") or 400.0
+    sps = m.get("pure_train_steps_per_s") or 0.1
+    n_units, n_test, n_a6 = 1500, 600, 1500
+    rounds = max(m.get("train_rounds_done") or 1, 1)
+    parts = {"sampling_4x": (n_units + n_test) * 4 * T / gen, "continuations_3_rounds": 3 * n_units * 4 * T / gen,
+             "logprobs": 3 * n_units * 4 * (T + 120) / (m.get("y3r2_lp_tok_per_s") or 4000.0),
+             "training": 3 * n_units * 4 * 0.6 / 16 / sps, "dev_evals": 3 * 6 * (m.get("dev_eval_sec") or 600) / rounds / 5,
+             "arms_and_harm": (n_test * 2 + 240) * T / gen, "a6_and_base": 2 * n_a6 * T / gen}
+    parts = {k: v / 3600 for k, v in parts.items()}
+    return sum(parts.values()), parts
+
+
+def _eval_block(m, tag, label, sets):
+    lines = [f"{label} AT CAP 3200:"]
+    for s in sets + ["pooled"]:
+        v = m.get(f"{tag}_pass1_{s}")
+        if v:
+            lines.append(f"  pass@1 {s} (n {v['n']}): base {_p(v['base'])} [{_p(v['base_ci'][0])}, {_p(v['base_ci'][1])}] -> A6 "
+                         f"{_p(v['a6'])} [{_p(v['a6_ci'][0])}, {_p(v['a6_ci'][1])}] | delta {_ci9(v, 'delta')} | tokens base/A6 "
+                         f"{_n(v['base_tokens'], 0)}/{_n(v['a6_tokens'], 0)} | truncation base/A6 {_p(v['base_trunc'])}/{_p(v['a6_trunc'])}")
+    for s in sets + ["pooled"]:
+        v = m.get(f"{tag}_arms_{s}")
+        if v:
+            lines.append(f"  E0 vs E6 {s} (n {v['n']}): E0 {_p(v['E0'])} ({_n(v['tok_E0'], 0)} tok, trunc {_p(v['trunc_E0'])}) ; E6 {_p(v['E6'])} "
+                         f"({_n(v['tok_E6'], 0)} tok, trunc {_p(v['trunc_E6'])}) | E6-E0 {_ci9(v, 'delta')}")
+    if m.get(f"{tag}_arms_cut"):
+        lines.append(f"  arms: {m[f'{tag}_arms_cut']}")
+    hs = " ; ".join(f"{s} {_p(m.get(f'{tag}_harm_adapter_{s}'))} vs {_p(m.get(f'{tag}_harm_plain_{s}'))}" for s in sets)
+    lines.append(f"  HARM (n {m.get(f'{tag}_harm_n')}): adapter {_p(m.get(f'{tag}_harm_adapter'))} vs plain {_p(m.get(f'{tag}_harm_plain'))}"
+                 + (f" | per set {hs}" if hs else ""))
+    return lines
+
+
+def smoke9(run_dir, m, cfg, m8):
+    env, _, lines = header(run_dir, m, {**cfg, "student": cfg["smoke8_model"], "teacher": "none (GRPO) / SMOKE-8 adapter re-evaluated"})
+    price = m["price_per_hr"]
+    stages = ("Y0", "Y1", "Y2", "Y3", "Y4", "Y5")
+    skipped = {s: m.get(f"{s}_skipped") for s in stages if m.get(f"{s}_skipped") and not str(m.get(f"{s}_skipped")).startswith("not needed")}
+    sets = list(m.get("y0_sets_from_smoke8") or ["rc3"]) + (["rc4"] if m.get("y1_rc4_added") else [])
+    hm = " ; ".join(f"{k[:-11]} {m[k]}/{m[k[:-4] + 'misses']}" for k in sorted(m) if k.endswith("_cache_hits"))
+    z6, z5 = m8.get("z6_pooled") or {}, m8.get("z5_pooled") or {}
+    lines += [
+        f"METHOD: cap 3200 everywhere; SMOKE-8 run {m.get('y0_smoke8_run')} re-evaluated (rkl adapter, no training) and a GRPO adapter "
+        f"(reward = primary correctness, groups of 4, DAPO dynamic sampling, no KL, clip 0.2, lr 5e-5) on the same units; no hint arms",
+        "TIMING (min): " + " | ".join(f"{s} {m.get(f'{s}_min')}" for s in stages) + f" | total {m['elapsed_min']:.2f}",
+        "Y0 ENV: " + (m["Y0_skipped"] if "Y0_skipped" in m else
+                      f"transformers {m.get('y0_transformers')} | class {m.get('y0_model_class')} | load {_n(m.get('y0_load_sec'), 0)} s | "
+                      f"VRAM {_n(m.get('y0_vram_gb_after_load'), 1)} GB | fast-path warning {'YES' if m.get('y0_fast_path_warning') else 'none'} | "
+                      f"log-prob batch {m.get('y0_lp_bs')} | micro {m.get('y0_micro')} | cache hits/misses {hm or 'n/a'}"),
+        f"SMOKE-8 AT CAP 800 (for comparison): pass@1 pooled base {_p(z6.get('base'))} -> A6 {_p(z6.get('a6'))} ({_ci9(z6, 'delta')}, n {z6.get('n')}) | "
+        f"E0 {_p(z5.get('rec_E0'))} ({_n(z5.get('tokens_E0'), 0)} tok, trunc {_p(z5.get('trunc_E0'))}) vs E6 {_p(z5.get('rec_E6'))} "
+        f"({_n(z5.get('tokens_E6'), 0)} tok, trunc {_p(z5.get('trunc_E6'))}), E6-E0 {_ci9(z5, 'e6_minus_e0')} (n {z5.get('n')}) | harm adapter "
+        f"{_p(m8.get('z5_harm_adapter'))} vs plain {_p(m8.get('z5_harm_plain'))} | sampled-trace truncation {_p(m8.get('z2_trunc'))}, mean tokens "
+        f"{_n(m8.get('z2_mean_tokens'), 0)}",
+    ]
+    if "Y1_skipped" in m:
+        lines.append(f"Y1: {m['Y1_skipped']}")
+    else:
+        lines += _eval_block(m, "rkl", "Y1 SMOKE-8 rkl ADAPTER", sets)
+        lines.append(f"  RC4 CALIBRATION at 3200 (student greedy, n {m.get('y1_rc4_cal_n')}): accuracy {_p(m.get('y1_rc4_cal_acc'))} | truncation "
+                     f"{_p(m.get('y1_rc4_cal_trunc'))} | tokens {_n(m.get('y1_rc4_cal_tokens'), 0)} | in [35%, 70%]: "
+                     f"{'yes, RC4 added' if m.get('y1_rc4_added') else 'no'} (at 800: {_p(((m8.get('z1_cal') or {}).get('rc4') or {}).get('acc'))})")
+    if "Y2_skipped" in m:
+        lines.append(f"Y2 RC4 DATA: {m['Y2_skipped']}")
+    else:
+        lines.append(f"Y2 RC4 DATA (cap 3200, 4 samples; greedy on test): problems {m.get('y2_problems')}/{m.get('y2_of')} | tok/s "
+                     f"{_n(m.get('y2_tok_per_s'), 1)} | mean tokens {_n(m.get('y2_mean_tokens'), 0)} | test units {m.get('y2_test_units')} | harm "
+                     f"{m.get('y2_harm')}" + (f" | {m['y2_cut']}" if m.get("y2_cut") else ""))
+        for sp in ("train", "test"):
+            v = m.get(f"y2_{sp}_rc4")
+            if v:
+                extra = f" | greedy acc {_p(v['greedy_acc'])} | wrong-greedy contested {v['wrong_greedy_contested']}" if "greedy_acc" in v else ""
+                lines.append(f"  {sp}: problems {v['problems']} | #correct of 4 {v['hist']} | accuracy {_p(v['acc'])} | contested {_p(v['contested'])} | "
+                             f"truncation {_p(v['trunc'])}{extra}")
+    if "Y3_skipped" in m:
+        lines.append(f"Y3 GRPO: {m['Y3_skipped']}")
+    else:
+        lines.append(f"Y3 GRPO: units {m.get('y3_units')} {m.get('y3_units_by_set')} | dev {m.get('y3_dev')} {m.get('y3_dev_by_set')} | rounds "
+                     f"{m.get('train_rounds_done')} | executed steps {m.get('executed_steps')} | best round {m.get('train_best_round')} step "
+                     f"{m.get('train_best_step')} dev E6 recovery {_p(m.get('train_best_dev'))} | early stopping fired {'y' if m.get('early_stop_fired') else 'n'} | "
+                     f"resume {'y' if m.get('resume_ok') else 'n' if m.get('resume_ok') is False else 'n/a'}{' (exact)' if m.get('resume_exact') else ''} "
+                     f"(max rel diff {_n(m.get('resume_max_rel_diff'), 6)}) | train {_n(m.get('train_sec'), 0)} s (dev evals {_n(m.get('dev_eval_sec'), 0)} s, "
+                     f"sampling + log-probs {_n(m.get('resample_sec'), 0)} s) | steps/s pure {_n(m.get('pure_train_steps_per_s'), 4)} | adapter params "
+                     f"{m.get('adapter_params')}" + (f" | {m['rounds_stopped']}" if m.get("rounds_stopped") else "")
+                     + (f" | {m['train_blocker']}" if m.get("train_blocker") else ""))
+        for r in m.get("train_rounds") or []:
+            tag = f"y3r{r['round']}"
+            g = m.get(f"{tag}_groups") or {}
+            src = (f"reused SMOKE-8 continuations {m.get('y3r1_reused_smoke8')} (dropped {m.get('y3r1_dropped_truncated')} truncated at 800)" if r["round"] == 1 else
+                   f"sampled {m.get(f'{tag}_continuations')} (primary {_p(m.get(f'{tag}_cont_primary'))}, trunc {_p(m.get(f'{tag}_cont_trunc'))}, "
+                   f"mean tokens {_n(m.get(f'{tag}_mean_tokens'), 0)})")
+            curve = " ; ".join(f"{s}: {_p(v)}" for s, v in r["curve"])
+            lines.append(f"  round {r['round']}: {src} | groups {g.get('groups')} kept {g.get('kept')} (dropped all-correct {g.get('dropped_all_correct')}, "
+                         f"all-wrong {g.get('dropped_all_wrong')}, incomplete {g.get('incomplete')}) -> examples {r['examples']} | steps {r['steps']} | loss start/end "
+                         f"{_n(r['loss_start'], 4)}/{_n(r['loss_end'], 4)} | dev per eval (step: rate) {curve or 'n/a'} | best step {r['best_step']} | "
+                         f"stopped early {'y' if r['stopped'] else 'n'}{' | CUT by deadline' if r.get('cut') else ''}")
+        for r in range(2, 4):
+            if m.get(f"round{r}_skipped"):
+                lines.append(f"  round {r}: {m[f'round{r}_skipped']}")
+    if "Y4_skipped" in m:
+        lines.append(f"Y4 GRPO ADAPTER: {m['Y4_skipped']}")
+    else:
+        lines += _eval_block(m, "grpo", "Y4 GRPO ADAPTER", sets)
+    # summary per set at 3200 and the brevity line
+    lines.append("SUMMARY AT CAP 3200 (pass@1 base / A6 rkl / A6 grpo ; E6-E0 rkl / grpo ; harm rkl / grpo):")
+    for s in sets + ["pooled"]:
+        r, g = m.get(f"rkl_pass1_{s}") or {}, m.get(f"grpo_pass1_{s}") or {}
+        ra, ga = m.get(f"rkl_arms_{s}") or {}, m.get(f"grpo_arms_{s}") or {}
+        lines.append(f"  {s}: pass@1 base {_p(r.get('base'))} | A6 rkl {_p(r.get('a6'))} ({_ci9(r, 'delta')}) | A6 grpo {_p(g.get('a6'))} "
+                     f"({_ci9(g, 'delta')}) ; E6-E0 rkl {_ci9(ra, 'delta')} | grpo {_ci9(ga, 'delta')} ; harm rkl "
+                     f"{_p(m.get(f'rkl_harm_adapter_{s}') if s != 'pooled' else m.get('rkl_harm_adapter'))} / grpo "
+                     f"{_p(m.get(f'grpo_harm_adapter_{s}') if s != 'pooled' else m.get('grpo_harm_adapter'))} (plain "
+                     f"{_p(m.get(f'rkl_harm_plain_{s}') if s != 'pooled' else m.get('rkl_harm_plain'))})")
+    b_e6 = brev(z5.get("e6_minus_e0"), (m.get("rkl_arms_pooled") or {}).get("delta"))
+    b_a6 = brev(z6.get("delta"), (m.get("rkl_pass1_pooled") or {}).get("delta"))
+    lines.append(f"BREVITY: of SMOKE-8's gain at cap 800, the part that disappears at 3200 with the same adapter = E6-E0 {_pt(z5.get('e6_minus_e0'))} - "
+                 f"{_pt((m.get('rkl_arms_pooled') or {}).get('delta'))} = {_pt(b_e6)} points ; A6 pass@1 {_pt(z6.get('delta'))} - "
+                 f"{_pt((m.get('rkl_pass1_pooled') or {}).get('delta'))} = {_pt(b_a6)} points")
+    hours, parts = s9_projection(m, price, m8)
+    rk, gp = m.get("rkl_pass1_pooled") or {}, m.get("grpo_pass1_pooled") or {}
+    verdict = {True: "pass", False: "fail", None: "n/a"}
+    gates = {
+        "env (fast path, model loaded)": None if "Y0_skipped" in m else bool(not m.get("y0_fast_path_warning")),
+        "re-evaluation complete (rkl pass@1, arms, harm)": None if "Y1_skipped" in m else bool(
+            m.get("rkl_pass1_n") == m.get("rkl_pass1_of") and "rkl_arms_pooled" in m and not _bad(m.get("rkl_harm_plain"))),
+        "pipeline (resume, early stop fired)": None if "Y3_skipped" in m or m.get("resume_ok") is None else bool(m.get("resume_ok") and m.get("early_stop_fired")),
+        "rkl A6 > base at 3200 (CI lower bound > 0)": None if "delta" not in rk else bool(rk["delta_ci"][0] > 0),
+        "grpo A6 > base at 3200 (CI lower bound > 0)": None if "delta" not in gp else bool(gp["delta_ci"][0] > 0),
+        "harm (each adapter <= 1.5 x plain)": None if _bad(m.get("rkl_harm_adapter")) or _bad(m.get("rkl_harm_plain")) else bool(
+            m["rkl_harm_adapter"] <= 1.5 * m["rkl_harm_plain"] and (_bad(m.get("grpo_harm_adapter")) or m["grpo_harm_adapter"] <= 1.5 * m["rkl_harm_plain"])),
+        "timing (FULL <= 12 h per seed at 3200)": hours <= 12,
+    }
+    lines += [
+        f"THROUGHPUT: base greedy tok/s {_n(m.get('rkl_base_tok_per_s'), 1)} | A6 tok/s {_n(m.get('rkl_a6_tok_per_s'), 1)} | GRPO sampling tok/s "
+        f"{_n(m.get('y3r2_gen_tok_per_s'), 1)} | train steps/s pure {_n(m.get('pure_train_steps_per_s'), 4)}",
+        f"PROJECTION: FULL at cap 3200 {hours:.1f} h and ${hours * price:.2f} per seed on this tier (rough; "
+        + ", ".join(f"{k} {v:.1f} h" for k, v in parts.items()) + ")",
+        "GATES: " + " ; ".join(f"{k} {verdict[v]}" for k, v in gates.items()),
+        f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} <= ${cfg['phase_budget_usd'][env['phase']]}",
+        "BLOCKERS: " + ("; ".join(f"{s} {v}" for s, v in skipped.items()) if skipped else "none"),
+    ]
+    m["smoke9_gates"] = gates
+    m["smoke9_brevity"] = {"e6_minus_e0": b_e6, "a6_pass1": b_a6}
+    _write(run_dir, lines, m)
+
+
+def brev(d800, d3200):
+    return None if d800 is None or d3200 is None else d800 - d3200
