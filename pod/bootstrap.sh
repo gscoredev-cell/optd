@@ -168,15 +168,24 @@ want = (c.get("phase_models") or {}).get(os.environ["PHASE"]) or list(c["models_
   for line in "${lines[@]}"; do
     name=${line%% *}; [ -f "/workspace/models/${name##*/}/.complete" ] || need=$(python3 -c "print(int($need + ${line##* } + 1))")
   done
-  free=$(df --output=avail -B1G /workspace | tail -1 | tr -d ' ')
-  for dir in /workspace/models/*/; do
+  # df sees the backing store, not the volume's quota: free = volume_gb - du. Evict unused cached models first, then venvs
+  # other than this run's (all re-creatable).
+  local vol; vol=$(sed -nE 's/^volume_gb: *([0-9]+).*$/\1/p' config/run_defaults.yaml); vol=${vol:-60}
+  volfree() { echo $(( vol - $(du -sxB1G /workspace 2>/dev/null | cut -f1) )); }
+  free=$(volfree)
+  for dir in /workspace/models/*/ /workspace/venv/*/; do
+    [ -d "$dir" ] || continue
     [ "$free" -lt $((need + 5)) ] || break
     name=$(basename "$dir")
-    printf '%s\n' "${lines[@]}" | grep -q "/$name " && continue
-    echo "volume short on space (free ${free} GB, need ${need} GB): removing cached $name (re-downloadable)"; rm -rf "$dir"
-    free=$(df --output=avail -B1G /workspace | tail -1 | tr -d ' ')
+    case "$dir" in
+      /workspace/models/*) printf '%s\n' "${lines[@]}" | grep -q "/$name " && continue ;;
+      *) [ "$dir" = "$venv/" ] && continue ;;
+    esac
+    echo "volume short on space (free ${free} GB, need ${need} GB): removing cached $dir (re-creatable)"; rm -rf "$dir"
+    free=$(volfree)
   done
-  echo "volume free: ${free} GB; models to fetch need ${need} GB"
+  echo "volume free: ${free} GB of ${vol}; models to fetch need ${need} GB"
+  [ "$free" -ge "$need" ] || { echo "volume still short: free ${free} GB < need ${need} GB" > "$R/.err"; exit 1; }
   for line in "${lines[@]}"; do fetch model ${line}; done
   fetch dataset "$(sed -nE 's/^dataset: *"(.*)"$/\1/p' config/run_defaults.yaml)" 0
   flock -u 8

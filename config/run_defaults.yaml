@@ -4,6 +4,7 @@ image: "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
 min_cuda_version: "12.8"
 container_disk_gb: 30
 network_volume_id: "5l0v4bx88l"
+volume_gb: 60
 datacenter: "US-KS-2"
 s3_endpoint: "https://s3api-us-ks-2.runpod.io"
 s3_region: "us-ks-2"
