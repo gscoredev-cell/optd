@@ -71,6 +71,37 @@ def _loss(model, ex, loss_kind, n_tokens, clip_eps=None):
     return -(lp * valid).sum() / n_tokens
 
 
+def _loss_plain(model, ex, loss_kind, n_tokens, clip_eps=None):
+    """Same objective as _loss with one full adapter-on forward over prefix + continuation (no prefix cache): for models
+    whose cache object cannot be handed to a second forward (hybrid linear-attention models). The sampler must then also
+    run the adapter over the whole sequence (SMOKE-8: generation from the prompt with the adapter on)."""
+    import torch
+    from generate import _left_pad, adapter
+    dev = model.device
+    seqs = [e["prefix"] + e["cont"] for e in ex]
+    ids, mask, _ = _left_pad(seqs, 0, dev)
+    width = ids.shape[1]
+    with adapter(model, True):
+        logits = model(input_ids=ids, attention_mask=mask).logits
+    T = max(len(e["cont"]) for e in ex)
+    lp = torch.zeros(len(ex), T, device=dev)
+    for r, e in enumerate(ex):
+        c = e["cont"]
+        start = width - len(c) - 1
+        lr = logits[r, start:start + len(c)].float().log_softmax(-1)
+        lp[r, :len(c)] = lr.gather(-1, torch.tensor(c, dtype=torch.long, device=dev)[:, None]).squeeze(-1)
+    valid = torch.tensor([[1] * len(e["cont"]) + [0] * (T - len(e["cont"])) for e in ex], device=dev)
+    if loss_kind == "rkl":
+        pad = lambda key: torch.stack([torch.nn.functional.pad(e[key], (0, T - len(e[key]))) for e in ex]).to(dev)
+        adv = (-(pad("lp_s") - pad("lp_t"))).clamp(-5, 5)
+        if clip_eps:
+            ratio = (lp - pad("lp_s")).exp()
+            obj = torch.minimum(ratio * adv, ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv)
+            return -(obj * valid).sum() / n_tokens
+        return -(adv * lp * valid).sum() / n_tokens
+    return -(lp * valid).sum() / n_tokens
+
+
 def _evaluate(model, eval_fn, step, early):
     import time
     model.eval()
@@ -79,6 +110,9 @@ def _evaluate(model, eval_fn, step, early):
     early["eval_sec"] = early.get("eval_sec", 0.0) + time.time() - t0
     model.train()
     early.setdefault("curve", []).append([step, score])
+    if score != score:                      # NaN (empty dev set): no early-stopping signal
+        early["dev_nan"] = True
+        return False
     if early.get("best_score") is None or score > early["best_score"]:
         early.update({"best_score": score, "best_step": step, "best_state": lora_state(model), "bad": 0})
     else:
@@ -87,7 +121,8 @@ def _evaluate(model, eval_fn, step, early):
 
 
 def train(model, data, ckpt_dir, run_id, loss_kind="rkl", resume=False, stop_at=None, ckpt_every=10, micro=4,
-          eff=16, lr=1e-4, eval_fn=None, eval_every=10, patience=3, early=None, clip_eps=None, deadline=None):
+          eff=16, lr=1e-4, eval_fn=None, eval_every=10, patience=3, early=None, clip_eps=None, deadline=None,
+          loss_fn=None):
     """One epoch over data (dicts prefix, cont, lp_t, lp_s). Returns ({step: loss}, total optimizer steps)."""
     import torch
     from transformers import get_cosine_schedule_with_warmup
@@ -102,8 +137,12 @@ def train(model, data, ckpt_dir, run_id, loss_kind="rkl", resume=False, stop_at=
     start, losses = 0, {}
     early = early if early is not None else {}
     early["patience"] = patience
+    ckpts = sorted(ckpt_dir.glob("step_*.pt"))
+    if resume and not ckpts:
+        early["resume_from_scratch"] = True
+        resume = False
     if resume:
-        st = torch.load(max(ckpt_dir.glob("step_*.pt")), weights_only=False)
+        st = torch.load(ckpts[-1], weights_only=False)
         set_lora(model, st["lora"])
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
@@ -127,7 +166,7 @@ def train(model, data, ckpt_dir, run_id, loss_kind="rkl", resume=False, stop_at=
         opt.zero_grad(set_to_none=True)
         total = 0.0
         for j in range(0, len(idx), micro):
-            loss = _loss(model, [data[i] for i in idx[j:j + micro]], loss_kind, n_tokens, clip_eps)
+            loss = (loss_fn or _loss)(model, [data[i] for i in idx[j:j + micro]], loss_kind, n_tokens, clip_eps)
             loss.backward()
             total += loss.item()
         opt.step()

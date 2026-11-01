@@ -50,8 +50,8 @@ def header(run_dir, m, cfg):
         f"cache hits {hits} / downloads {len(got)} | download MB/s {mbps}",
         f"DEVICE: capability {cap} | bf16 matmul ok (rel err {m['bf16_matmul_rel_err']}) | tier {env['tier']} | "
         f"driver {env['driver']}",
-        f"TEMPLATES: identical token ids {m['template_identical_ids']}/{m['template_n']} | "
-        f"empty think block {m['template_empty_think']}/{m['template_n']}",
+        f"TEMPLATES: identical token ids {m.get('template_identical_ids', 'n/a')}/{m.get('template_n', 'n/a')} | "
+        f"empty think block {m.get('template_empty_think', 'n/a')}/{m.get('template_n', 'n/a')}",
     ]
 
 
@@ -772,4 +772,161 @@ def option_e(run_dir, m, cfg):
         "BLOCKERS: " + ("; ".join(blockers) if blockers else "none"),
     ]
     m["option_e_gates"] = gates
+    _write(run_dir, lines, m)
+
+
+# ---- SMOKE-8 (Qwen3.5-9B self-teacher; no pointer arms) --------------------------------------------------------------
+
+S8_ARMS = ("E0", "E2", "E6", "E6h")
+
+
+def _d8(st, key):
+    ci = st.get(key + "_ci") or [None, None]
+    return f"{_pt(st.get(key))} [{_pt(ci[0])}, {_pt(ci[1])}]"
+
+
+def s8_projection(m, price):
+    """FULL per seed from the SMOKE-8 rates: 1,500 contested train problems x 4 continuations x 3 rounds (+ teacher
+    scoring and training at the pure steps/s), 600 test units x 4 arms + harm, A6 on 1,500 test problems."""
+    T = m.get("z2_mean_tokens") or 300.0
+    gen = m.get("z5_gen_tok_per_s") or m.get("z4r1_gen_tok_per_s") or m.get("z2_tok_per_s") or 300.0
+    prefill = m.get("z4r1_prefill_tok_per_s") or m.get("z3_prefill_tok_per_s") or 3000.0
+    sps = m.get("pure_train_steps_per_s") or 0.3
+    n_units, n_test, n_a6 = 1500, 600, 1500
+    parts = {"continuations_3_rounds": 3 * n_units * 4 * T / gen,
+             "teacher_scoring": 3 * n_units * 4 * 2 * (2 * T + 120) / prefill,
+             "training": 3 * n_units * 4 / 16 / sps, "dev_evals": 3 * 6 * (m.get("dev_eval_sec") or 300) / max(m.get("train_rounds_done") or 1, 1),
+             "arms_and_harm": (n_test * 4 + 120) * T / gen, "a6": n_a6 * T / gen,
+             "sampling_4x": (n_units + n_test) * 4 * T / gen}
+    parts = {k: v / 3600 for k, v in parts.items()}
+    return sum(parts.values()), parts
+
+
+def smoke8(run_dir, m, cfg):
+    env, _, lines = header(run_dir, m, {**cfg, "student": cfg["smoke8_model"], "teacher": cfg["smoke8_model"] + " + reference"})
+    price = m["price_per_hr"]
+    stages = ("Z0", "Z1", "Z2", "Z3", "Z4", "Z5", "Z6", "Z7")
+    skipped = {s: m.get(f"{s}_skipped") for s in stages if m.get(f"{s}_skipped")}
+    hm = " ; ".join(f"{k[:-11]} {m[k]}/{m[k[:-4] + 'misses']}" for k in sorted(m) if k.endswith("_cache_hits"))
+    lines += [
+        "METHOD: Qwen3.5-9B student; self-teacher = same weights with a 'Reference solution' system line (dataset answer / "
+        "RC evaluation steps); training units = contested train problems, restart from the prompt, 4 continuations with "
+        "the adapter on over the whole sequence; rkl + PPO clip 0.2, lr 5e-5, dev 30 traces every 10 steps, <= 3 rounds; "
+        "arms E0 / E2 (hint) / E6 (adapter) / E6h (adapter + hint); A6 = adapter always on, greedy",
+        "TIMING (min): " + " | ".join(f"{s} {m.get(f'{s}_min')}" for s in stages) + f" | total {m['elapsed_min']:.2f}",
+        "Z0 ENV: " + (m["Z0_skipped"] if "Z0_skipped" in m else
+                      f"transformers {m.get('z0_transformers')} (>= 5: {'y' if m.get('z0_transformers_ge5') else 'n'}) | fla "
+                      f"{m.get('z0_fla')} | causal_conv1d {m.get('z0_causal_conv1d')} | triton {m.get('z0_triton')} | peft "
+                      f"{m.get('z0_peft')} | class {m.get('z0_model_class')} | params {_n(m.get('z0_params_b'), 2)} B | load "
+                      f"{_n(m.get('z0_load_sec'), 0)} s | VRAM after load {_n(m.get('z0_vram_gb_after_load'), 1)} GB | fast-path "
+                      f"warning {'YES' if m.get('z0_fast_path_warning') else 'none'} | module flags {m.get('z0_module_fast_path_flags')} "
+                      f"| load warnings {m.get('z0_load_warnings')}"),
+    ]
+    if "Z0_skipped" not in m:
+        lines.append(f"  TEMPLATES (20 prompts, student vs teacher variant, enable_thinking=False): common suffix >= user turn "
+                     f"{m.get('z0_suffix_covers_user_turn')}/20 (min common suffix {m.get('z0_common_suffix_min')} tokens, user "
+                     f"tokens mean {_n(m.get('z0_user_tokens_mean'), 1)}) | think block in render {m.get('z0_think_block')}/20 | "
+                     f"hint round-trips {m.get('z0_hint_roundtrip')} | prompt tail {m.get('z0_prompt_tail')} | smoke generation "
+                     f"{m.get('z0_gen_smoke_tokens')} tokens in {_n(m.get('z0_gen_smoke_sec'), 1)} s")
+    lines.append("Z1 CALIBRATION (student greedy, 60 per set; keep accuracy in [35%, 70%]): " + (
+        m["Z1_skipped"] if "Z1_skipped" in m else " ; ".join(
+            f"{s} {_p(v['acc'])} (strict {_p(v['strict'])}, trunc {_p(v['trunc'])}, n {v['n']}, {_n(v['mean_tokens'], 0)} tok)"
+            for s, v in (m.get("z1_cal") or {}).items()) + f" | chosen {m.get('z1_chosen')} | tok/s {_n(m.get('z1_tok_per_s'), 1)}"))
+    if "Z2_skipped" in m:
+        lines.append(f"Z2 DATA: {m['Z2_skipped']}")
+    else:
+        lines.append(f"Z2 DATA (4 samples per problem, T 0.8, cap 800; greedy on test): problems {m.get('z2_problems')}/{m.get('z2_of')} "
+                     f"(sizes train {m.get('z2_sizes_train')}, test {m.get('z2_sizes_test')}) | tok/s {_n(m.get('z2_tok_per_s'), 1)} | "
+                     f"truncation {_p(m.get('z2_trunc'))} | mean tokens {_n(m.get('z2_mean_tokens'), 1)} | test units (wrong greedy "
+                     f"of contested test) {m.get('z2_test_units')} | harm traces {m.get('z2_harm_traces')} | cache hits/misses {hm or 'n/a'}")
+        for k in sorted(k for k in m if (k.startswith("z2_train_") or k.startswith("z2_test_")) and isinstance(m[k], dict)):
+            v = m[k]
+            extra = f" | greedy acc {_p(v['greedy_acc'])} | wrong-greedy contested {v['wrong_greedy_contested']}" if "greedy_acc" in v else ""
+            lines.append(f"  {k[3:]}: problems {v['problems']} | #correct of 4 {v['hist']} | accuracy {_p(v['acc'])} | contested "
+                         f"{_p(v['contested'])}{extra}")
+    lines.append("Z3 SELF-TEACHER: " + (m["Z3_skipped"] if "Z3_skipped" in m else
+                 f"teacher greedy accuracy with the reference {_p(m.get('z3_teacher_acc'))} (n {m.get('z3_teacher_n')}; "
+                 + ", ".join(f"{k[15:]} {_p(v)}" for k, v in sorted(m.items()) if k.startswith("z3_teacher_acc_"))
+                 + f") | teacher tok/s {_n(m.get('z3_teacher_tok_per_s'), 1)} | mean per-token log-prob gap teacher - student: "
+                 f"correct traces {_n(m.get('z3_gap_correct'), 3)} (n {m.get('z3_gap_n_correct')}), wrong traces "
+                 f"{_n(m.get('z3_gap_wrong'), 3)} (n {m.get('z3_gap_n_wrong')}) | student mean log-prob correct/wrong "
+                 f"{_n(m.get('z3_student_logp_correct'), 3)}/{_n(m.get('z3_student_logp_wrong'), 3)} | prefill tok/s "
+                 f"{_n(m.get('z3_prefill_tok_per_s'), 1)}"))
+    if "Z4_skipped" in m:
+        lines.append(f"Z4 TRAIN: {m['Z4_skipped']}")
+    else:
+        lines.append(f"Z4 TRAIN: units {m.get('z4_units')} {m.get('z4_units_by_set')} | dev {m.get('z4_dev')} {m.get('z4_dev_by_set')} | "
+                     f"rounds {m.get('train_rounds_done')} | executed steps {m.get('executed_steps')} | best round {m.get('train_best_round')} "
+                     f"step {m.get('train_best_step')} dev E6 recovery {_p(m.get('train_best_dev'))} | early stopping fired "
+                     f"{'y' if m.get('early_stop_fired') else 'n'} | resume {'y' if m.get('resume_ok') else 'n' if m.get('resume_ok') is False else 'n/a'}"
+                     f"{' (exact)' if m.get('resume_exact') else ''} (kill at {m.get('train_kill_at')}, ckpt every {m.get('train_ckpt_every')}, "
+                     f"max rel diff {_n(m.get('resume_max_rel_diff'), 6)}) | train {_n(m.get('train_sec'), 0)} s (dev evals "
+                     f"{_n(m.get('dev_eval_sec'), 0)} s, resampling + scoring {_n(m.get('resample_sec'), 0)} s) | steps/s pure "
+                     f"{_n(m.get('pure_train_steps_per_s'), 4)} (overall {_n(m.get('train_steps_per_s'), 4)}) | adapter params "
+                     f"{m.get('adapter_params')} | micro {m.get('z4_micro')}"
+                     + (f" | {m['rounds_stopped']}" if m.get("rounds_stopped") else "")
+                     + (f" | {m['train_blocker']}" if m.get("train_blocker") else ""))
+        for r in m.get("train_rounds") or []:
+            tag = f"z4r{r['round']}"
+            curve = " ; ".join(f"{s}: {_p(v)}" for s, v in r["curve"])
+            lines.append(f"  round {r['round']}: continuations {m.get(f'{tag}_continuations')} (primary {_p(m.get(f'{tag}_cont_primary'))}, "
+                         f"trunc {_p(m.get(f'{tag}_cont_trunc'))}, teacher-also-wrong {_p(m.get(f'{tag}_teacher_also_wrong'))}, mean adv "
+                         f"{_n(m.get(f'{tag}_mean_adv'))}) | steps {r['steps']} | loss start/end {_n(r['loss_start'], 4)}/{_n(r['loss_end'], 4)} | "
+                         f"dev per eval (step: rate) {curve or 'n/a'} | best step {r['best_step']} | stopped early {'y' if r['stopped'] else 'n'}"
+                         f"{' | CUT by deadline' if r.get('cut') else ''}")
+        for r in range(2, 4):
+            if m.get(f"round{r}_skipped"):
+                lines.append(f"  round {r}: {m[f'round{r}_skipped']}")
+    if "Z5_skipped" in m:
+        lines.append(f"Z5 ARMS: {m['Z5_skipped']}")
+    else:
+        lines.append(f"Z5 ARMS (test units = wrong greedy traces of contested test problems; one sampled continuation per arm, "
+                     f"identical batches and seeds; adapter {'trained' if m.get('z5_adapter_trained') else 'UNTRAINED'}; arms done "
+                     f"{m.get('z5_arms_done')}{' | ' + m['z5_arms_cut'] if m.get('z5_arms_cut') else ''}):")
+        for s in sorted(k[3:] for k in m if k.startswith("z5_") and isinstance(m[k], dict) and "rec_E0" in m[k]):
+            st = m[f"z5_{s}"]
+            lines.append(f"  {s} (n {st['n']}, problems {st['problems']}): " + " ; ".join(
+                f"{a} {_p(st.get(f'rec_{a}'))} ({_n(st.get(f'tokens_{a}'), 0)} tok, trunc {_p(st.get(f'trunc_{a}'))})" for a in S8_ARMS))
+        lines.append(f"  HARM (correct greedy test traces resampled from the prompt, n {m.get('z5_harm_n')}): adapter "
+                     f"{_p(m.get('z5_harm_adapter'))} vs plain {_p(m.get('z5_harm_plain'))}")
+        lines.append("  DELTAS (points; 95% CI by cluster bootstrap on original_id, 10,000 resamples):")
+        for s in sorted(k[3:] for k in m if k.startswith("z5_") and isinstance(m[k], dict) and "e6_minus_e0" in m[k]):
+            st = m[f"z5_{s}"]
+            lines.append(f"    {s} (n {st['n']}): E6-E0 {_d8(st, 'e6_minus_e0')} | E2-E0 {_d8(st, 'e2_minus_e0')} | E6h-E0 "
+                         f"{_d8(st, 'e6h_minus_e0')} | E6h-E6 {_d8(st, 'e6h_minus_e6')} | E6-E2 {_d8(st, 'e6_minus_e2')}")
+    lines.append("Z6 PASS@1 (greedy on all test problems, base vs adapter always on): " + (
+        m["Z6_skipped"] if "Z6_skipped" in m else " ; ".join(
+            f"{k[3:]} base {_p(v['base'])} -> A6 {_p(v['a6'])} ({_pt(v['delta'])} [{_pt(v['delta_ci'][0])}, {_pt(v['delta_ci'][1])}], n {v['n']})"
+            for k, v in sorted(m.items()) if k.startswith("z6_") and isinstance(v, dict))
+        + f" | A6 tok/s {_n(m.get('z6_tok_per_s'), 1)} | A6 truncation {_p(m.get('z6_a6_trunc'))}"
+        + (f" | {m['z6_cut']}" if m.get("z6_cut") else "")))
+    hours, parts = s8_projection(m, price)
+    pooled = m.get("z5_pooled") or {}
+    verdict = {True: "pass", False: "fail", None: "n/a"}
+    gates = {
+        "env (transformers >= 5, fast path, template suffix 20/20)": None if "Z0_skipped" in m else bool(
+            m.get("z0_transformers_ge5") and not m.get("z0_fast_path_warning") and m.get("z0_suffix_covers_user_turn") == 20),
+        "calibration (>= 1 set in band)": None if "Z1_skipped" in m else bool(m.get("z1_chosen")),
+        "pipeline (resume, early stop fired)": None if "Z4_skipped" in m or m.get("resume_ok") is None else bool(
+            m.get("resume_ok") and m.get("early_stop_fired")),
+        "teacher (accuracy with reference >= 90%)": None if _bad(m.get("z3_teacher_acc")) else bool(m["z3_teacher_acc"] >= 0.9),
+        "signal (E6-E0 pooled CI lower bound > 0)": None if "e6_minus_e0" not in pooled else bool(pooled["e6_minus_e0_ci"][0] > 0),
+        "harm (adapter <= 1.5 x plain)": None if _bad(m.get("z5_harm_adapter")) or _bad(m.get("z5_harm_plain")) else bool(
+            m["z5_harm_adapter"] <= 1.5 * m["z5_harm_plain"]),
+        "pass@1 (A6 >= base pooled)": None if "z6_pooled" not in m or m.get("z6_cut") or not m.get("z6_adapter_trained")
+        else bool(m["z6_pooled"]["delta"] >= 0),
+        "timing (FULL <= 12 h per seed)": hours <= 12,
+    }
+    lines += [
+        f"THROUGHPUT: sampling tok/s {_n(m.get('z2_tok_per_s'), 1)} | adapter gen tok/s {_n(m.get('z5_gen_tok_per_s'), 1)} | teacher "
+        f"prefill tok/s {_n(m.get('z4r1_prefill_tok_per_s') or m.get('z3_prefill_tok_per_s'), 1)} | train steps/s pure "
+        f"{_n(m.get('pure_train_steps_per_s'), 4)}",
+        f"PROJECTION: FULL {hours:.1f} h and ${hours * price:.2f} per seed on this tier (rough; "
+        + ", ".join(f"{k} {v:.1f} h" for k, v in parts.items()) + ")",
+        "GATES: " + " ; ".join(f"{k} {verdict[v]}" for k, v in gates.items()),
+        f"BUDGET: max_minutes {env['max_minutes']} x ${price:.2f}/h = ${price * int(env['max_minutes']) / 60:.2f} "
+        f"<= ${cfg['phase_budget_usd'][env['phase']]}",
+        "BLOCKERS: " + ("; ".join(f"{s} {v}" for s, v in skipped.items()) if skipped else "none"),
+    ]
+    m["smoke8_gates"] = gates
     _write(run_dir, lines, m)

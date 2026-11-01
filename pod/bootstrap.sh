@@ -124,19 +124,27 @@ main() {
   # 4. venv on the volume keyed by image tag + requirements hash. torch is pinned to the image's exact build (a dev
   #    build in this image), so pip never pulls a second torch into the venv.
   step venv
-  local image venv req
+  local image venv req reqfile
   image=$(sed -nE 's/^image: *"(.*)"$/\1/p' config/run_defaults.yaml)
+  reqfile=pod/requirements.txt; [ -f "pod/requirements_$PHASE.txt" ] && reqfile="pod/requirements_$PHASE.txt"   # per-phase stack
   { cat pod/constraints.txt; echo "torch==$(python3 -c 'import torch; print(torch.__version__)')"; } > /tmp/constraints.txt
-  req=$(cat pod/requirements.txt /tmp/constraints.txt | sha256sum | cut -c1-12)
+  req=$(cat "$reqfile" /tmp/constraints.txt | sha256sum | cut -c1-12)
   venv=/workspace/venv/$(printf '%s' "$image" | tr -c 'A-Za-z0-9._-' '_')-$req
-  echo "constraints: $(grep -v '^#' /tmp/constraints.txt | tr '\n' ' ')"
+  echo "requirements: $reqfile ; constraints: $(grep -v '^#' /tmp/constraints.txt | tr '\n' ' ')"
   (
     flock 9
     if [ -f "$venv/.complete" ]; then echo "venv cache hit $venv"
     else
       rm -rf "$venv"; python3 -m venv --system-site-packages "$venv"
-      "$venv/bin/pip" install -q --disable-pip-version-check -r pod/requirements.txt -c /tmp/constraints.txt < /dev/null
+      "$venv/bin/pip" install -q --disable-pip-version-check -r "$reqfile" -c /tmp/constraints.txt < /dev/null
       touch "$venv/.complete"; echo "venv installed $venv"
+      grep -q '^flash-linear-attention' "$reqfile" && touch "$venv/.no_fastpath"   # Qwen3.5 fast path needs causal-conv1d too
+    fi
+    if [ -f "$venv/.no_fastpath" ]; then   # retried on every pod until it succeeds (prebuilt wheel, else a build)
+      local t0; t0=$(date +%s)
+      if MAX_JOBS=8 "$venv/bin/pip" install -q --disable-pip-version-check --no-build-isolation causal-conv1d==1.7.0 < /dev/null; then
+        rm -f "$venv/.no_fastpath"; echo "causal-conv1d installed in $(( $(date +%s) - t0 )) s"
+      else echo "WARN causal-conv1d install failed after $(( $(date +%s) - t0 )) s (slow path this run)"; fi
     fi
   ) 9> /workspace/.venv.lock
   # shellcheck disable=SC1091
@@ -148,7 +156,27 @@ main() {
   mkdir -p /workspace/models /workspace/hf
   local line
   exec 8> /workspace/.dl.lock; flock 8
-  mapfile -t lines < <(python -c 'import yaml; c = yaml.safe_load(open("config/run_defaults.yaml")); [print(r, g) for r, g in c["models_min_gb"].items()]')
+  # phase_models lists the repos a phase needs (default: every entry of models_min_gb). Before a large download on a short
+  # volume (free < 25 GB) the unused cached Qwen3-4B is evicted (re-downloadable).
+  mapfile -t lines < <(python -c '
+import os, yaml
+c = yaml.safe_load(open("config/run_defaults.yaml"))
+want = (c.get("phase_models") or {}).get(os.environ["PHASE"]) or list(c["models_min_gb"])
+[print(r, c["models_min_gb"][r]) for r in want]')
+  # space: the missing wanted models must fit with 5 GB to spare; otherwise evict cached models this phase does not use
+  local need=0 free dir name
+  for line in "${lines[@]}"; do
+    name=${line%% *}; [ -f "/workspace/models/${name##*/}/.complete" ] || need=$(python3 -c "print(int($need + ${line##* } + 1))")
+  done
+  free=$(df --output=avail -B1G /workspace | tail -1 | tr -d ' ')
+  for dir in /workspace/models/*/; do
+    [ "$free" -lt $((need + 5)) ] || break
+    name=$(basename "$dir")
+    printf '%s\n' "${lines[@]}" | grep -q "/$name " && continue
+    echo "volume short on space (free ${free} GB, need ${need} GB): removing cached $name (re-downloadable)"; rm -rf "$dir"
+    free=$(df --output=avail -B1G /workspace | tail -1 | tr -d ' ')
+  done
+  echo "volume free: ${free} GB; models to fetch need ${need} GB"
   for line in "${lines[@]}"; do fetch model ${line}; done
   fetch dataset "$(sed -nE 's/^dataset: *"(.*)"$/\1/p' config/run_defaults.yaml)" 0
   flock -u 8

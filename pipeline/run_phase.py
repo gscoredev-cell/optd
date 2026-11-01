@@ -156,7 +156,8 @@ def main():
     try:
         m = {"pipeline_start": time.time()}
         run_stage(run_dir, "env", stage_env, m)
-        run_stage(run_dir, "templates", lambda d: stage_templates(d, cfg), m)
+        if a.phase != "SMOKE8":            # SMOKE-8 checks its own two prompt variants in Z0 (other tokenizers)
+            run_stage(run_dir, "templates", lambda d: stage_templates(d, cfg), m)
         if a.phase == "ENVCHECK":
             run_stage(run_dir, "gen", lambda d: stage_gen(d, cfg, tiers, a.tier), m)
             run_stage(run_dir, "teacher_prefill",
@@ -185,6 +186,21 @@ def main():
                     smoke.free()
             write_status(run_dir, "report")
             report.option_e(run_dir, m, cfg)
+        elif a.phase == "SMOKE8":
+            import smoke8
+            c8 = smoke8.Ctx8(cfg, tiers, a.tier, a.run_id, run_dir)
+            c8.metrics = m
+            for name, fn in smoke8.STAGES:
+                try:
+                    run_stage(run_dir, name, lambda d, fn=fn: fn(c8, d), m)
+                except Exception as e:
+                    m[f"{name}_skipped"] = f"error: {type(e).__name__}: {(str(e).splitlines() or [''])[0][:200]}"
+                    print(f"== stage {name} failed: {m[f'{name}_skipped']}")
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            write_status(run_dir, "report")
+            report.smoke8(run_dir, m, cfg)
         elif a.phase in ("SMOKE3", "SMOKE4", "SMOKE5"):
             import importlib
             import smoke

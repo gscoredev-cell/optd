@@ -38,7 +38,8 @@ def eos_ids(model):
 
 def prompt_ids(tok, question):
     return list(tok.apply_chat_template([{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}],
-                                        tokenize=True, add_generation_prompt=True, enable_thinking=False))
+                                        tokenize=True, add_generation_prompt=True, enable_thinking=False,
+                                        return_dict=False))   # transformers 5 returns a BatchEncoding by default
 
 
 def adapter(model, on):

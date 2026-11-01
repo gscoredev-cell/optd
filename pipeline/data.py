@@ -65,10 +65,15 @@ def _expr(rng, n_ops):
     return f"{sa}{op}{sb}", ca + cb + 1
 
 
-def eval_expr(s):
-    """Exact value of an expression string: + - * / ^int, parentheses, \\frac{a}{b}. Left-associative."""
+def eval_expr(s, steps=None):
+    """Exact value of an expression string: + - * / ^int, parentheses, \\frac{a}{b}. Left-associative. With a list
+    `steps`, every binary operation is appended as "a op b = v" in evaluation order (the reference solution's steps)."""
     toks = re.findall(r"\\frac|\d+|[-+*/^(){}]", s)
     pos = 0
+
+    def note(a, op, b, v):
+        if steps is not None:
+            steps.append(f"{_fmt(a)} {op} {_fmt(b)} = {_fmt(v)}")
 
     def peek():
         return toks[pos] if pos < len(toks) else None
@@ -85,6 +90,7 @@ def eval_expr(s):
         t = peek()
         if t == "\\frac":
             take(); take("{"); n = expr(); take("}"); take("{"); d = expr(); take("}")
+            note(n, "/", d, n / d)
             return n / d
         if t == "(":
             take(); v = expr(); take(")")
@@ -98,25 +104,54 @@ def eval_expr(s):
         v = base()
         if peek() == "^":
             take()
-            v = v ** int(take())
+            e = int(take())
+            note(v, "^", Fraction(e), v ** e)
+            v = v ** e
         return v
 
     def term():
         v = factor()
         while peek() in ("*", "/"):
-            v = v * factor() if take() == "*" else v / factor()
+            op = take()
+            w = factor()
+            r = v * w if op == "*" else v / w
+            note(v, op, w, r)
+            v = r
         return v
 
     def expr():
         v = term()
         while peek() in ("+", "-"):
-            v = v + term() if take() == "+" else v - term()
+            op = take()
+            w = term()
+            r = v + w if op == "+" else v - w
+            note(v, op, w, r)
+            v = r
         return v
 
     v = expr()
     if pos != len(toks):
         raise ValueError(f"trailing tokens in {s!r}")
     return v
+
+
+def _fmt(v):
+    """Fraction as an integer, an exact decimal (denominator 2^a 5^b, up to 12 places), or a/b."""
+    if v.denominator == 1:
+        return str(v.numerator)
+    for k in range(1, 13):
+        if (v * 10 ** k).denominator == 1:
+            n = (v * 10 ** k).numerator
+            s = f"{abs(n):0{k + 1}d}"
+            return ("-" if n < 0 else "") + s[:-k] + "." + s[-k:]
+    return f"{v.numerator}/{v.denominator}"
+
+
+def rc_reference(p):
+    """Reference solution text for a RandomCalculation problem: the evaluation steps and the result (SMOKE-8 teacher)."""
+    steps = []
+    v = eval_expr(p["expr"], steps)
+    return "\n".join(steps + [f"The final answer is {_fmt(v)}"])
 
 
 def random_calculation(n, seed=0, min_ops=4, max_ops=8):
